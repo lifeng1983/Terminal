@@ -36,6 +36,9 @@ namespace Microsoft::Console::Types
         virtual const bool IsSelectionActive() const = 0;
         virtual void ClearSelection() = 0;
         virtual void SelectNewRegion(const COORD coordStart, const COORD coordEnd) = 0;
+        virtual const COORD GetSelectionAnchor() const noexcept = 0;
+        virtual const COORD GetEndSelectionPosition() const noexcept = 0;
+        virtual void ColorSelection(const COORD coordSelectionStart, const COORD coordSelectionEnd, const TextAttribute attr) = 0;
     };
 
     // See docs/virtual-dtors.md for an explanation of why this is weird.

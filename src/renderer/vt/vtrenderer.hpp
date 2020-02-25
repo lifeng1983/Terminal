@@ -18,10 +18,19 @@ Author(s):
 #include "../inc/RenderEngineBase.hpp"
 #include "../../inc/IDefaultColorProvider.hpp"
 #include "../../inc/ITerminalOutputConnection.hpp"
+#include "../../inc/ITerminalOwner.hpp"
 #include "../../types/inc/Viewport.hpp"
 #include "tracing.hpp"
 #include <string>
 #include <functional>
+
+// fwdecl unittest classes
+#ifdef UNIT_TESTING
+namespace TerminalCoreUnitTests
+{
+    class ConptyRoundtripTests;
+};
+#endif
 
 namespace Microsoft::Console::Render
 {
@@ -32,12 +41,11 @@ namespace Microsoft::Console::Render
         static const size_t ERASE_CHARACTER_STRING_LENGTH = 8;
         static const COORD INVALID_COORDS;
 
-        VtEngine(wil::unique_hfile hPipe,
-                 wil::shared_event shutdownEvent,
+        VtEngine(_In_ wil::unique_hfile hPipe,
                  const Microsoft::Console::IDefaultColorProvider& colorProvider,
                  const Microsoft::Console::Types::Viewport initialViewport);
 
-        ~VtEngine() override;
+        virtual ~VtEngine() override = default;
 
         [[nodiscard]] HRESULT InvalidateSelection(const std::vector<SMALL_RECT>& rectangles) noexcept override;
         [[nodiscard]] virtual HRESULT InvalidateScroll(const COORD* const pcoordDelta) noexcept = 0;
@@ -69,7 +77,7 @@ namespace Microsoft::Console::Render
         [[nodiscard]] virtual HRESULT UpdateDrawingBrushes(const COLORREF colorForeground,
                                                            const COLORREF colorBackground,
                                                            const WORD legacyColorAttribute,
-                                                           const bool isBold,
+                                                           const ExtendedAttributes extendedAttrs,
                                                            const bool isSettingDefaultBrushes) noexcept = 0;
         [[nodiscard]] HRESULT UpdateFont(const FontInfoDesired& pfiFontInfoDesired,
                                          _Out_ FontInfo& pfiFontInfo) noexcept override;
@@ -89,18 +97,15 @@ namespace Microsoft::Console::Render
         [[nodiscard]] HRESULT RequestCursor() noexcept;
         [[nodiscard]] HRESULT InheritCursor(const COORD coordCursor) noexcept;
 
-        [[nodiscard]] HRESULT WriteTerminalUtf8(const std::string& str) noexcept;
+        [[nodiscard]] HRESULT WriteTerminalUtf8(const std::string_view str) noexcept;
 
-        [[nodiscard]] virtual HRESULT WriteTerminalW(const std::wstring& str) noexcept = 0;
+        [[nodiscard]] virtual HRESULT WriteTerminalW(const std::wstring_view str) noexcept = 0;
 
+        void SetTerminalOwner(Microsoft::Console::ITerminalOwner* const terminalOwner);
         void BeginResizeRequest();
         void EndResizeRequest();
 
     protected:
-        wil::shared_event _shutdownEvent;
-        std::future<void> _shutdownWatchdog;
-        std::atomic<DWORD> _blockedThreadId;
-
         wil::unique_hfile _hFile;
         std::string _buffer;
 
@@ -132,8 +137,14 @@ namespace Microsoft::Console::Render
         bool _newBottomLine;
         COORD _deferredCursorPos;
 
+        bool _pipeBroken;
+        HRESULT _exitResult;
+        Microsoft::Console::ITerminalOwner* _terminalOwner;
+
         Microsoft::Console::VirtualTerminal::RenderTracing _trace;
         bool _inResizeRequest{ false };
+
+        bool _delayedEolWrap{ false };
 
         [[nodiscard]] HRESULT _Write(std::string_view const str) noexcept;
         [[nodiscard]] HRESULT _WriteFormattedString(const std::string* const pFormat, ...) noexcept;
@@ -172,8 +183,19 @@ namespace Microsoft::Console::Render
         [[nodiscard]] HRESULT _ResizeWindow(const short sWidth, const short sHeight) noexcept;
 
         [[nodiscard]] HRESULT _BeginUnderline() noexcept;
-
         [[nodiscard]] HRESULT _EndUnderline() noexcept;
+
+        [[nodiscard]] HRESULT _BeginItalics() noexcept;
+        [[nodiscard]] HRESULT _EndItalics() noexcept;
+
+        [[nodiscard]] HRESULT _BeginBlink() noexcept;
+        [[nodiscard]] HRESULT _EndBlink() noexcept;
+
+        [[nodiscard]] HRESULT _BeginInvisible() noexcept;
+        [[nodiscard]] HRESULT _EndInvisible() noexcept;
+
+        [[nodiscard]] HRESULT _BeginCrossedOut() noexcept;
+        [[nodiscard]] HRESULT _EndCrossedOut() noexcept;
 
         [[nodiscard]] HRESULT _RequestCursor() noexcept;
 
@@ -197,8 +219,8 @@ namespace Microsoft::Console::Render
         [[nodiscard]] HRESULT _PaintAsciiBufferLine(std::basic_string_view<Cluster> const clusters,
                                                     const COORD coord) noexcept;
 
-        [[nodiscard]] HRESULT _WriteTerminalUtf8(const std::wstring& str) noexcept;
-        [[nodiscard]] HRESULT _WriteTerminalAscii(const std::wstring& str) noexcept;
+        [[nodiscard]] HRESULT _WriteTerminalUtf8(const std::wstring_view str) noexcept;
+        [[nodiscard]] HRESULT _WriteTerminalAscii(const std::wstring_view str) noexcept;
 
         [[nodiscard]] virtual HRESULT _DoUpdateTitle(const std::wstring& newTitle) noexcept override;
 
@@ -208,6 +230,8 @@ namespace Microsoft::Console::Render
         bool _usingTestCallback;
 
         friend class VtRendererTest;
+        friend class ConptyOutputTests;
+        friend class TerminalCoreUnitTests::ConptyRoundtripTests;
 #endif
 
         void SetTestCallback(_In_ std::function<bool(const char* const, size_t const)> pfn);

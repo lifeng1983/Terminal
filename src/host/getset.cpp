@@ -269,7 +269,7 @@ void ApiRoutines::GetNumberOfConsoleMouseButtonsImpl(ULONG& buttons) noexcept
         consoleFontInfoEx.FontFamily = fontInfo.GetFamily();
         consoleFontInfoEx.FontWeight = fontInfo.GetWeight();
 
-        RETURN_IF_FAILED(StringCchCopyW(consoleFontInfoEx.FaceName, ARRAYSIZE(consoleFontInfoEx.FaceName), fontInfo.GetFaceName()));
+        RETURN_IF_FAILED(fontInfo.FillLegacyNameBuffer(gsl::make_span(consoleFontInfoEx.FaceName)));
 
         return S_OK;
     }
@@ -300,7 +300,7 @@ void ApiRoutines::GetNumberOfConsoleMouseButtonsImpl(ULONG& buttons) noexcept
         RETURN_IF_FAILED(StringCchCopyW(FaceName, ARRAYSIZE(FaceName), consoleFontInfoEx.FaceName));
 
         FontInfo fi(FaceName,
-                    static_cast<BYTE>(consoleFontInfoEx.FontFamily),
+                    gsl::narrow_cast<unsigned char>(consoleFontInfoEx.FontFamily),
                     consoleFontInfoEx.FontWeight,
                     consoleFontInfoEx.dwFontSize,
                     gci.OutputCP);
@@ -504,18 +504,18 @@ void ApiRoutines::GetLargestConsoleWindowSizeImpl(const SCREEN_INFORMATION& cont
 
         SCREEN_INFORMATION& screenInfo = context.GetActiveBuffer();
 
+        // microsoft/terminal#3907 - We shouldn't resize the buffer to be
+        // smaller than the viewport. This was previously erroneously checked
+        // when the host was not in conpty mode.
+        RETURN_HR_IF(E_INVALIDARG, (size.X < screenInfo.GetViewport().Width() || size.Y < screenInfo.GetViewport().Height()));
+
         // see MSFT:17415266
         // We only really care about the minimum window size if we have a head.
         if (!ServiceLocator::LocateGlobals().IsHeadless())
         {
             COORD const coordMin = screenInfo.GetMinWindowSizeInCharacters();
-            // clang-format off
             // Make sure requested screen buffer size isn't smaller than the window.
-            RETURN_HR_IF(E_INVALIDARG, (size.X < screenInfo.GetViewport().Width() ||
-                                        size.Y < screenInfo.GetViewport().Height() ||
-                                        size.Y < coordMin.Y ||
-                                        size.X < coordMin.X));
-            // clang-format on
+            RETURN_HR_IF(E_INVALIDARG, (size.Y < coordMin.Y || size.X < coordMin.X));
         }
 
         // Ensure the requested size isn't larger than we can handle in our data type.
@@ -836,32 +836,6 @@ void ApiRoutines::GetLargestConsoleWindowSizeImpl(const SCREEN_INFORMATION& cont
         auto& buffer = context.GetActiveBuffer();
 
         TextAttribute useThisAttr(fillAttribute);
-
-        // Here we're being a little clever - similar to FillConsoleOutputAttributeImpl
-        // Because RGB/default color can't roundtrip the API, certain VT
-        //      sequences will forget the RGB color because their first call to
-        //      GetScreenBufferInfo returned a legacy attr.
-        // If they're calling this with the legacy attrs version of our current
-        //      attributes, they likely wanted to use the full version of
-        //      our current attributes, whether that be RGB or _default_ colored.
-        // This could create a scenario where someone emitted RGB with VT,
-        //      THEN used the API to ScrollConsoleOutput with the legacy attrs,
-        //      and DIDN'T want the RGB color. As in FillConsoleOutputAttribute,
-        //      this scenario is highly unlikely, and we can reasonably do this
-        //      on their behalf.
-        // see MSFT:19853701
-
-        if (buffer.InVTMode())
-        {
-            const auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
-            const auto currentAttributes = buffer.GetAttributes();
-            const auto bufferLegacy = gci.GenerateLegacyAttributes(currentAttributes);
-            if (bufferLegacy == fillAttribute)
-            {
-                useThisAttr = currentAttributes;
-            }
-        }
-
         ScrollRegion(buffer, source, clip, target, fillCharacter, useThisAttr);
 
         return S_OK;
@@ -981,6 +955,39 @@ void DoSrvPrivateBoldText(SCREEN_INFORMATION& screenInfo, const bool bolded)
     buffer.SetAttributes(attrs);
 }
 
+// Method Description:
+// - Retrieves the active ExtendedAttributes (italic, underline, etc.) of the
+//   given screen buffer. Text written to this buffer will be written with these
+//   attributes.
+// Arguments:
+// - screenInfo: The buffer to get the extended attrs from.
+// Return Value:
+// - the currently active ExtendedAttributes.
+ExtendedAttributes DoSrvPrivateGetExtendedTextAttributes(SCREEN_INFORMATION& screenInfo)
+{
+    auto& buffer = screenInfo.GetActiveBuffer();
+    auto attrs = buffer.GetAttributes();
+    return attrs.GetExtendedAttributes();
+}
+
+// Method Description:
+// - Sets the active ExtendedAttributes (italic, underline, etc.) of the given
+//   screen buffer. Text written to this buffer will be written with these
+//   attributes.
+// Arguments:
+// - screenInfo: The buffer to set the extended attrs for.
+// - extendedAttrs: The new ExtendedAttributes to use
+// Return Value:
+// - <none>
+void DoSrvPrivateSetExtendedTextAttributes(SCREEN_INFORMATION& screenInfo,
+                                           const ExtendedAttributes extendedAttrs)
+{
+    auto& buffer = screenInfo.GetActiveBuffer();
+    auto attrs = buffer.GetAttributes();
+    attrs.SetExtendedAttributes(extendedAttrs);
+    buffer.SetAttributes(attrs);
+}
+
 // Routine Description:
 // - Sets the codepage used for translating text when calling A versions of functions affecting the output buffer.
 // Arguments:
@@ -1060,10 +1067,10 @@ void ApiRoutines::GetConsoleInputCodePageImpl(ULONG& codepage) noexcept
     CATCH_LOG();
 }
 
-void DoSrvGetConsoleOutputCodePage(_Out_ unsigned int* const pCodePage)
+void DoSrvGetConsoleOutputCodePage(unsigned int& codepage)
 {
     const CONSOLE_INFORMATION& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
-    *pCodePage = gci.OutputCP;
+    codepage = gci.OutputCP;
 }
 
 // Routine Description:
@@ -1076,9 +1083,9 @@ void ApiRoutines::GetConsoleOutputCodePageImpl(ULONG& codepage) noexcept
     {
         LockConsole();
         auto Unlock = wil::scope_exit([&] { UnlockConsole(); });
-        unsigned int uiCodepage;
-        DoSrvGetConsoleOutputCodePage(&uiCodepage);
-        codepage = uiCodepage;
+        unsigned int cp;
+        DoSrvGetConsoleOutputCodePage(cp);
+        codepage = cp;
     }
     CATCH_LOG();
 }
@@ -1285,6 +1292,51 @@ void ApiRoutines::GetConsoleDisplayModeImpl(ULONG& flags) noexcept
 }
 
 // Routine Description:
+// - A private API call for changing the screen mode between normal and reverse.
+//    When in reverse screen mode, the background and foreground colors are switched.
+// Parameters:
+// - reverseMode - set to true to enable reverse screen mode, false for normal mode.
+// Return value:
+// - STATUS_SUCCESS if handled successfully. Otherwise, an appropriate error code.
+[[nodiscard]] NTSTATUS DoSrvPrivateSetScreenMode(const bool reverseMode)
+{
+    try
+    {
+        Globals& g = ServiceLocator::LocateGlobals();
+        CONSOLE_INFORMATION& gci = g.getConsoleInformation();
+
+        gci.SetScreenReversed(reverseMode);
+
+        if (g.pRender)
+        {
+            g.pRender->TriggerRedrawAll();
+        }
+
+        return STATUS_SUCCESS;
+    }
+    catch (...)
+    {
+        return NTSTATUS_FROM_HRESULT(wil::ResultFromCaughtException());
+    }
+}
+
+// Routine Description:
+// - A private API call for setting the ENABLE_WRAP_AT_EOL_OUTPUT mode.
+//     This controls whether the cursor moves to the beginning of the next row
+//     when it reaches the end of the current row.
+// Parameters:
+// - wrapAtEOL - set to true to wrap, false to overwrite the last character.
+// Return value:
+// - STATUS_SUCCESS if handled successfully.
+[[nodiscard]] NTSTATUS DoSrvPrivateSetAutoWrapMode(const bool wrapAtEOL)
+{
+    auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
+    auto& outputMode = gci.GetActiveOutputBuffer().GetActiveBuffer().OutputMode;
+    WI_UpdateFlag(outputMode, ENABLE_WRAP_AT_EOL_OUTPUT, wrapAtEOL);
+    return STATUS_SUCCESS;
+}
+
+// Routine Description:
 // - A private API call for making the cursor visible or not. Does not modify
 //      blinking state.
 // Parameters:
@@ -1305,7 +1357,14 @@ void DoSrvPrivateShowCursor(SCREEN_INFORMATION& screenInfo, const bool show) noe
 void DoSrvPrivateAllowCursorBlinking(SCREEN_INFORMATION& screenInfo, const bool fEnable)
 {
     screenInfo.GetActiveBuffer().GetTextBuffer().GetCursor().SetBlinkingAllowed(fEnable);
-    screenInfo.GetActiveBuffer().GetTextBuffer().GetCursor().SetIsOn(!fEnable);
+
+    // GH#2642 - From what we've gathered from other terminals, when blinking is
+    // disabled, the cursor should remain On always, and have the visibility
+    // controlled by the IsVisible property. So when you do a printf "\e[?12l"
+    // to disable blinking, the cursor stays stuck On. At this point, only the
+    // cursor visibility property controls whether the user can see it or not.
+    // (Yes, the cursor can be On and NOT Visible)
+    screenInfo.GetActiveBuffer().GetTextBuffer().GetCursor().SetIsOn(true);
 }
 
 // Routine Description:
@@ -1315,29 +1374,58 @@ void DoSrvPrivateAllowCursorBlinking(SCREEN_INFORMATION& screenInfo, const bool 
 //     untouched.
 //  Currently only accessible through the use of ANSI sequence DECSTBM
 // Parameters:
-// - psrScrollMargins - A rect who's Top and Bottom members will be used to set
+// - scrollMargins - A rect who's Top and Bottom members will be used to set
 //     the new values of the top and bottom margins. If (0,0), then the margins
 //     will be disabled. NOTE: This is a rect in the case that we'll need the
 //     left and right margins in the future.
 // Return value:
 // - True if handled successfully. False otherwise.
-[[nodiscard]] NTSTATUS DoSrvPrivateSetScrollingRegion(SCREEN_INFORMATION& screenInfo, const SMALL_RECT* const psrScrollMargins)
+[[nodiscard]] NTSTATUS DoSrvPrivateSetScrollingRegion(SCREEN_INFORMATION& screenInfo, const SMALL_RECT& scrollMargins)
 {
     NTSTATUS Status = STATUS_SUCCESS;
 
-    if (psrScrollMargins->Top > psrScrollMargins->Bottom)
+    if (scrollMargins.Top > scrollMargins.Bottom)
     {
         Status = STATUS_INVALID_PARAMETER;
     }
     if (NT_SUCCESS(Status))
     {
         SMALL_RECT srScrollMargins = screenInfo.GetRelativeScrollMargins().ToInclusive();
-        srScrollMargins.Top = psrScrollMargins->Top;
-        srScrollMargins.Bottom = psrScrollMargins->Bottom;
+        srScrollMargins.Top = scrollMargins.Top;
+        srScrollMargins.Bottom = scrollMargins.Bottom;
         screenInfo.GetActiveBuffer().SetScrollMargins(Viewport::FromInclusive(srScrollMargins));
     }
 
     return Status;
+}
+
+// Routine Description:
+// - A private API call for performing a line feed, possibly preceded by carriage return.
+//    Moves the cursor down one line, and possibly also to the leftmost column.
+// Parameters:
+// - screenInfo - A pointer to the screen buffer that should perform the line feed.
+// - withReturn - Set to true if a carriage return should be performed as well.
+// Return value:
+// - STATUS_SUCCESS if handled successfully. Otherwise, an appropriate status code indicating the error.
+[[nodiscard]] NTSTATUS DoSrvPrivateLineFeed(SCREEN_INFORMATION& screenInfo, const bool withReturn)
+{
+    auto& textBuffer = screenInfo.GetTextBuffer();
+    auto cursorPosition = textBuffer.GetCursor().GetPosition();
+
+    // We turn the cursor on before an operation that might scroll the viewport, otherwise
+    // that can result in an old copy of the cursor being left behind on the screen.
+    textBuffer.GetCursor().SetIsOn(true);
+
+    // Since we are explicitly moving down a row, clear the wrap status on the row we're leaving
+    textBuffer.GetRowByOffset(cursorPosition.Y).GetCharRow().SetWrapForced(false);
+
+    cursorPosition.Y += 1;
+    if (withReturn)
+    {
+        cursorPosition.X = 0;
+    }
+
+    return AdjustCursorPosition(screenInfo, cursorPosition, FALSE, nullptr);
 }
 
 // Routine Description:
@@ -1389,89 +1477,15 @@ void DoSrvPrivateAllowCursorBlinking(SCREEN_INFORMATION& screenInfo, const bool 
             coordDestination.X = 0;
             coordDestination.Y = viewport.Top + 1;
 
-            // Here we previously called to ScrollConsoleScreenBufferWImpl to
-            // perform the scrolling operation. However, that function only
-            // accepts a WORD for the fill attributes. That means we'd lose
-            // 256/RGB fidelity for fill attributes. So instead, we'll just call
-            // ScrollRegion ourselves, with the same params that
-            // ScrollConsoleScreenBufferWImpl would have.
-            // See microsoft/terminal#832, #2702 for more context.
-            try
-            {
-                LockConsole();
-                auto Unlock = wil::scope_exit([&] { UnlockConsole(); });
-                ScrollRegion(screenInfo,
-                             srScroll,
-                             srScroll,
-                             coordDestination,
-                             UNICODE_SPACE,
-                             screenInfo.GetAttributes());
-            }
-            CATCH_LOG();
+            // Note the revealed lines are filled with the standard erase attributes.
+            Status = NTSTATUS_FROM_HRESULT(DoSrvPrivateScrollRegion(screenInfo,
+                                                                    srScroll,
+                                                                    srScroll,
+                                                                    coordDestination,
+                                                                    true));
         }
     }
     return Status;
-}
-
-// Routine Description:
-// - A private API call for moving the cursor vertically in the buffer. This is
-//      because the vertical cursor movements in VT are constrained by the
-//      scroll margins, while the absolute positioning is not.
-// Parameters:
-// - screenInfo - a reference to the screen buffer we should move the cursor for
-// - lines - The number of lines to move the cursor. Up is negative, down positive.
-// Return value:
-// - S_OK if handled successfully. Otherwise an appropriate HRESULT for failing to clamp.
-[[nodiscard]] HRESULT DoSrvMoveCursorVertically(SCREEN_INFORMATION& screenInfo, const short lines)
-{
-    auto& cursor = screenInfo.GetActiveBuffer().GetTextBuffer().GetCursor();
-    COORD clampedPos = { cursor.GetPosition().X, cursor.GetPosition().Y + lines };
-
-    // Make sure the cursor doesn't move outside the viewport.
-    screenInfo.GetViewport().Clamp(clampedPos);
-
-    // Make sure the cursor stays inside the margins
-    if (screenInfo.AreMarginsSet())
-    {
-        const auto margins = screenInfo.GetAbsoluteScrollMargins().ToInclusive();
-
-        const auto cursorY = cursor.GetPosition().Y;
-
-        const auto lo = margins.Top;
-        const auto hi = margins.Bottom;
-
-        // See microsoft/terminal#2929 - If the cursor is _below_ the top
-        // margin, it should stay below the top margin. If it's _above_ the
-        // bottom, it should stay above the bottom. Cursor movements that stay
-        // outside the margins shouldn't necessarily be affected. For example,
-        // moving up while below the bottom margin shouldn't just jump straight
-        // to the bottom margin. See
-        // ScreenBufferTests::CursorUpDownOutsideMargins for a test of that
-        // behavior.
-        const bool cursorBelowTop = cursorY >= lo;
-        const bool cursorAboveBottom = cursorY <= hi;
-
-        if (cursorBelowTop)
-        {
-            try
-            {
-                clampedPos.Y = std::max(clampedPos.Y, lo);
-            }
-            CATCH_RETURN();
-        }
-
-        if (cursorAboveBottom)
-        {
-            try
-            {
-                clampedPos.Y = std::min(clampedPos.Y, hi);
-            }
-            CATCH_RETURN();
-        }
-    }
-    cursor.SetPosition(clampedPos);
-
-    return S_OK;
 }
 
 // Routine Description:
@@ -1488,7 +1502,7 @@ void DoSrvPrivateAllowCursorBlinking(SCREEN_INFORMATION& screenInfo, const bool 
 }
 
 // Routine Description:
-// - A private API call for swaping to the main screen buffer. From the
+// - A private API call for swapping to the main screen buffer. From the
 //     alternate buffer, returns to the main screen buffer. From the main
 //     screen buffer, does nothing. The alternate is discarded.
 // Parameters:
@@ -1534,19 +1548,15 @@ void DoSrvPrivateUseMainScreenBuffer(SCREEN_INFORMATION& screenInfo)
 {
     CONSOLE_INFORMATION& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
     SCREEN_INFORMATION& _screenBuffer = gci.GetActiveOutputBuffer().GetActiveBuffer();
+    COORD cursorPos = _screenBuffer.GetTextBuffer().GetCursor().GetPosition();
 
-    NTSTATUS Status = STATUS_SUCCESS;
     FAIL_FAST_IF(!(sNumTabs >= 0));
-    for (SHORT sTabsExecuted = 0; sTabsExecuted < sNumTabs && NT_SUCCESS(Status); sTabsExecuted++)
+    for (SHORT sTabsExecuted = 0; sTabsExecuted < sNumTabs; sTabsExecuted++)
     {
-        const COORD cursorPos = _screenBuffer.GetTextBuffer().GetCursor().GetPosition();
-        COORD cNewPos = (fForward) ? _screenBuffer.GetForwardTab(cursorPos) : _screenBuffer.GetReverseTab(cursorPos);
-        // GetForwardTab is smart enough to move the cursor to the next line if
-        // it's at the end of the current one already. AdjustCursorPos shouldn't
-        // to be doing anything funny, just moving the cursor to the location GetForwardTab returns
-        Status = AdjustCursorPosition(_screenBuffer, cNewPos, TRUE, nullptr);
+        cursorPos = (fForward) ? _screenBuffer.GetForwardTab(cursorPos) : _screenBuffer.GetReverseTab(cursorPos);
     }
-    return Status;
+
+    return AdjustCursorPosition(_screenBuffer, cursorPos, TRUE, nullptr);
 }
 
 // Routine Description:
@@ -1700,24 +1710,14 @@ void DoSrvSetCursorColor(SCREEN_INFORMATION& screenInfo,
 //   of extra unnecessary data and takes a lot of extra processing time.
 // Parameters
 // - screenInfo - The screen buffer to retrieve default color attributes information from
-// - pwAttributes - Pointer to space that will receive color attributes data
+// - attributes - Space that will receive color attributes data
 // Return Value:
 // - STATUS_SUCCESS if we succeeded or STATUS_INVALID_PARAMETER for bad params (nullptr).
-[[nodiscard]] NTSTATUS DoSrvPrivateGetConsoleScreenBufferAttributes(_In_ const SCREEN_INFORMATION& screenInfo, _Out_ WORD* const pwAttributes)
+[[nodiscard]] NTSTATUS DoSrvPrivateGetConsoleScreenBufferAttributes(const SCREEN_INFORMATION& screenInfo, WORD& attributes)
 {
-    NTSTATUS Status = STATUS_SUCCESS;
+    attributes = screenInfo.GetActiveBuffer().GetAttributes().GetLegacyAttributes();
 
-    if (pwAttributes == nullptr)
-    {
-        Status = STATUS_INVALID_PARAMETER;
-    }
-
-    if (NT_SUCCESS(Status))
-    {
-        *pwAttributes = screenInfo.GetActiveBuffer().GetAttributes().GetLegacyAttributes();
-    }
-
-    return Status;
+    return STATUS_SUCCESS;
 }
 
 // Routine Description:
@@ -2066,10 +2066,10 @@ void DoSrvPrivateRefreshWindow(_In_ const SCREEN_INFORMATION& screenInfo)
 // - isPty: receives the bool indicating whether or not we're in pty mode.
 // Return value:
 //  <none>
-void DoSrvIsConsolePty(_Out_ bool* const pIsPty)
+void DoSrvIsConsolePty(bool& isPty)
 {
     const CONSOLE_INFORMATION& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
-    *pIsPty = gci.IsInVtIoMode();
+    isPty = gci.IsInVtIoMode();
 }
 
 // Routine Description:
@@ -2081,11 +2081,11 @@ void DoSrvPrivateSetDefaultTabStops()
 
 // Routine Description:
 // - internal logic for adding or removing lines in the active screen buffer
-//   this also moves the cursor to the left margin, which is expected behaviour for IL and DL
+//   this also moves the cursor to the left margin, which is expected behavior for IL and DL
 // Parameters:
 // - count - the number of lines to modify
 // - insert - true if inserting lines, false if deleting lines
-void DoSrvPrivateModifyLinesImpl(const unsigned int count, const bool insert)
+void DoSrvPrivateModifyLinesImpl(const size_t count, const bool insert)
 {
     auto& screenInfo = ServiceLocator::LocateGlobals().getConsoleInformation().GetActiveOutputBuffer().GetActiveBuffer();
     auto& textBuffer = screenInfo.GetTextBuffer();
@@ -2116,25 +2116,12 @@ void DoSrvPrivateModifyLinesImpl(const unsigned int count, const bool insert)
             coordDestination.Y = (cursorPosition.Y) - gsl::narrow<short>(count);
         }
 
-        // Here we previously called to ScrollConsoleScreenBufferWImpl to
-        // perform the scrolling operation. However, that function only accepts
-        // a WORD for the fill attributes. That means we'd lose 256/RGB fidelity
-        // for fill attributes. So instead, we'll just call ScrollRegion
-        // ourselves, with the same params that ScrollConsoleScreenBufferWImpl
-        // would have.
-        // See microsoft/terminal#832 for more context.
-        try
-        {
-            LockConsole();
-            auto Unlock = wil::scope_exit([&] { UnlockConsole(); });
-            ScrollRegion(screenInfo,
-                         srScroll,
-                         srScroll,
-                         coordDestination,
-                         UNICODE_SPACE,
-                         screenInfo.GetAttributes());
-        }
-        CATCH_LOG();
+        // Note the revealed lines are filled with the standard erase attributes.
+        LOG_IF_FAILED(DoSrvPrivateScrollRegion(screenInfo,
+                                               srScroll,
+                                               srScroll,
+                                               coordDestination,
+                                               true));
 
         // The IL and DL controls are also expected to move the cursor to the left margin.
         // For now this is just column 0, since we don't yet support DECSLRM.
@@ -2146,7 +2133,7 @@ void DoSrvPrivateModifyLinesImpl(const unsigned int count, const bool insert)
 // - a private API call for deleting lines in the active screen buffer.
 // Parameters:
 // - count - the number of lines to delete
-void DoSrvPrivateDeleteLines(const unsigned int count)
+void DoSrvPrivateDeleteLines(const size_t count)
 {
     DoSrvPrivateModifyLinesImpl(count, false);
 }
@@ -2155,7 +2142,7 @@ void DoSrvPrivateDeleteLines(const unsigned int count)
 // - a private API call for inserting lines in the active screen buffer.
 // Parameters:
 // - count - the number of lines to insert
-void DoSrvPrivateInsertLines(const unsigned int count)
+void DoSrvPrivateInsertLines(const size_t count)
 {
     DoSrvPrivateModifyLinesImpl(count, true);
 }
@@ -2254,6 +2241,102 @@ void DoSrvPrivateMoveToBottom(SCREEN_INFORMATION& screenInfo)
             g.pRender->TriggerRedrawAll();
         }
 
+        return S_OK;
+    }
+    CATCH_RETURN();
+}
+
+// Routine Description:
+// - A private API call for filling a region of the screen buffer.
+// Arguments:
+// - screenInfo - Reference to screen buffer info.
+// - startPosition - The position to begin filling at.
+// - fillLength - The number of characters to fill.
+// - fillChar - Character to fill the target region with.
+// - standardFillAttrs - If true, fill with the standard erase attributes.
+//                       If false, fill with the default attributes.
+// Return value:
+// - S_OK or failure code from thrown exception
+[[nodiscard]] HRESULT DoSrvPrivateFillRegion(SCREEN_INFORMATION& screenInfo,
+                                             const COORD startPosition,
+                                             const size_t fillLength,
+                                             const wchar_t fillChar,
+                                             const bool standardFillAttrs) noexcept
+{
+    try
+    {
+        if (fillLength == 0)
+        {
+            return S_OK;
+        }
+
+        LockConsole();
+        auto Unlock = wil::scope_exit([&] { UnlockConsole(); });
+
+        // For most VT erasing operations, the standard requires that the
+        // erased area be filled with the current background color, but with
+        // no additional meta attributes set. For all other cases, we just
+        // fill with the default attributes.
+        auto fillAttrs = TextAttribute{};
+        if (standardFillAttrs)
+        {
+            fillAttrs = screenInfo.GetAttributes();
+            fillAttrs.SetStandardErase();
+        }
+
+        const auto fillData = OutputCellIterator{ fillChar, fillAttrs, fillLength };
+        screenInfo.Write(fillData, startPosition, false);
+
+        // Notify accessibility
+        auto endPosition = startPosition;
+        const auto bufferSize = screenInfo.GetBufferSize();
+        bufferSize.MoveInBounds(fillLength - 1, endPosition);
+        screenInfo.NotifyAccessibilityEventing(startPosition.X, startPosition.Y, endPosition.X, endPosition.Y);
+        return S_OK;
+    }
+    CATCH_RETURN();
+}
+
+// Routine Description:
+// - A private API call for moving a block of data in the screen buffer,
+//    optionally limiting the effects of the move to a clipping rectangle.
+// Arguments:
+// - screenInfo - Reference to screen buffer info.
+// - scrollRect - Region to copy/move (source and size).
+// - clipRect - Optional clip region to contain buffer change effects.
+// - destinationOrigin - Upper left corner of target region.
+// - standardFillAttrs - If true, fill with the standard erase attributes.
+//                       If false, fill with the default attributes.
+// Return value:
+// - S_OK or failure code from thrown exception
+[[nodiscard]] HRESULT DoSrvPrivateScrollRegion(SCREEN_INFORMATION& screenInfo,
+                                               const SMALL_RECT scrollRect,
+                                               const std::optional<SMALL_RECT> clipRect,
+                                               const COORD destinationOrigin,
+                                               const bool standardFillAttrs) noexcept
+{
+    try
+    {
+        LockConsole();
+        auto Unlock = wil::scope_exit([&] { UnlockConsole(); });
+
+        // For most VT scrolling operations, the standard requires that the
+        // erased area be filled with the current background color, but with
+        // no additional meta attributes set. For all other cases, we just
+        // fill with the default attributes.
+        auto fillAttrs = TextAttribute{};
+        if (standardFillAttrs)
+        {
+            fillAttrs = screenInfo.GetAttributes();
+            fillAttrs.SetStandardErase();
+        }
+
+        ScrollRegion(screenInfo,
+                     scrollRect,
+                     clipRect,
+                     destinationOrigin,
+                     UNICODE_SPACE,
+                     fillAttrs);
         return S_OK;
     }
     CATCH_RETURN();

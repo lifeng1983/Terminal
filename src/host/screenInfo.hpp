@@ -50,6 +50,14 @@ Revision History:
 #include "../types/IConsoleWindow.hpp"
 class ConversionAreaInfo; // forward decl window. circular reference
 
+// fwdecl unittest classes
+#ifdef UNIT_TESTING
+namespace TerminalCoreUnitTests
+{
+    class ConptyRoundtripTests;
+};
+#endif
+
 class SCREEN_INFORMATION : public ConsoleObjectHeader, public Microsoft::Console::IIoProvider
 {
 public:
@@ -113,8 +121,6 @@ public:
     bool SendNotifyBeep() const;
     bool PostUpdateWindowSize() const;
 
-    bool InVTMode() const;
-
     // TODO: MSFT 9355062 these methods should probably be a part of construction/destruction. http://osgvsowi/9355062
     static void s_InsertScreenBuffer(_In_ SCREEN_INFORMATION* const pScreenInfo);
     static void s_RemoveScreenBuffer(_In_ SCREEN_INFORMATION* const pScreenInfo);
@@ -168,13 +174,6 @@ public:
     SCREEN_INFORMATION* Next;
     BYTE WriteConsoleDbcsLeadByte[2];
     BYTE FillOutDbcsLeadChar;
-    WCHAR LineChar[6];
-#define UPPER_LEFT_CORNER 0
-#define UPPER_RIGHT_CORNER 1
-#define HORIZONTAL_LINE 2
-#define VERTICAL_LINE 3
-#define BOTTOM_LEFT_CORNER 4
-#define BOTTOM_RIGHT_CORNER 5
 
     // non ownership pointer
     ConversionAreaInfo* ConvScreenInfo;
@@ -280,6 +279,7 @@ private:
 
     bool _IsAltBuffer() const;
     bool _IsInPtyMode() const;
+    bool _IsInVTMode() const;
 
     std::shared_ptr<Microsoft::Console::VirtualTerminal::StateMachine> _stateMachine;
 
@@ -314,5 +314,7 @@ private:
     friend class TextBufferIteratorTests;
     friend class ScreenBufferTests;
     friend class CommonState;
+    friend class ConptyOutputTests;
+    friend class TerminalCoreUnitTests::ConptyRoundtripTests;
 #endif
 };

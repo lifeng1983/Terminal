@@ -25,6 +25,10 @@
 
 #include "../../types/inc/Viewport.hpp"
 
+#include <TraceLoggingProvider.h>
+
+TRACELOGGING_DECLARE_PROVIDER(g_hDxRenderProvider);
+
 namespace Microsoft::Console::Render
 {
     class DxEngine final : public RenderEngineBase
@@ -48,6 +52,8 @@ namespace Microsoft::Console::Render
         [[nodiscard]] HRESULT SetWindowSize(const SIZE pixels) noexcept;
 
         void SetCallback(std::function<void()> pfn);
+
+        void SetRetroTerminalEffects(bool enable) noexcept;
 
         ::Microsoft::WRL::ComPtr<IDXGISwapChain1> GetSwapChain();
 
@@ -80,7 +86,7 @@ namespace Microsoft::Console::Render
         [[nodiscard]] HRESULT UpdateDrawingBrushes(COLORREF const colorForeground,
                                                    COLORREF const colorBackground,
                                                    const WORD legacyColorAttribute,
-                                                   const bool isBold,
+                                                   const ExtendedAttributes extendedAttrs,
                                                    bool const isSettingDefaultBrushes) noexcept override;
         [[nodiscard]] HRESULT UpdateFont(const FontInfoDesired& fiFontInfoDesired, FontInfo& fiFontInfo) noexcept override;
         [[nodiscard]] HRESULT UpdateDpi(int const iDpi) noexcept override;
@@ -97,8 +103,11 @@ namespace Microsoft::Console::Render
 
         float GetScaling() const noexcept;
 
+        void SetSelectionBackground(const COLORREF color) noexcept;
+
     protected:
         [[nodiscard]] HRESULT _DoUpdateTitle(_In_ const std::wstring& newTitle) noexcept override;
+        [[nodiscard]] HRESULT _PaintTerminalEffects() noexcept;
 
     private:
         enum class SwapChainMode
@@ -127,6 +136,7 @@ namespace Microsoft::Console::Render
 
         D2D1_COLOR_F _foregroundColor;
         D2D1_COLOR_F _backgroundColor;
+        D2D1_COLOR_F _selectionBackground;
 
         [[nodiscard]] RECT _GetDisplayRect() const noexcept;
 
@@ -144,6 +154,8 @@ namespace Microsoft::Console::Render
         RECT _presentScroll;
         POINT _presentOffset;
         DXGI_PRESENT_PARAMETERS _presentParams;
+
+        static std::atomic<size_t> _tracelogCount;
 
         static const ULONG s_ulMinCursorHeightPercent = 25;
         static const ULONG s_ulMaxCursorHeightPercent = 100;
@@ -168,7 +180,18 @@ namespace Microsoft::Console::Render
         ::Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> _d2dBrushBackground;
         ::Microsoft::WRL::ComPtr<IDXGISwapChain1> _dxgiSwapChain;
 
+        // Terminal effects resources.
+        bool _retroTerminalEffects;
+        ::Microsoft::WRL::ComPtr<ID3D11RenderTargetView> _renderTargetView;
+        ::Microsoft::WRL::ComPtr<ID3D11VertexShader> _vertexShader;
+        ::Microsoft::WRL::ComPtr<ID3D11PixelShader> _pixelShader;
+        ::Microsoft::WRL::ComPtr<ID3D11InputLayout> _vertexLayout;
+        ::Microsoft::WRL::ComPtr<ID3D11Buffer> _screenQuadVertexBuffer;
+        ::Microsoft::WRL::ComPtr<ID3D11SamplerState> _samplerState;
+        ::Microsoft::WRL::ComPtr<ID3D11Texture2D> _framebufferCapture;
+
         [[nodiscard]] HRESULT _CreateDeviceResources(const bool createSwapChain) noexcept;
+        HRESULT _SetupTerminalEffects();
 
         [[nodiscard]] HRESULT _PrepareRenderTarget() noexcept;
 

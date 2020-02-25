@@ -42,7 +42,6 @@ SCREEN_INFORMATION::SCREEN_INFORMATION(
     Next{ nullptr },
     WriteConsoleDbcsLeadByte{ 0, 0 },
     FillOutDbcsLeadChar{ 0 },
-    // LineChar initialized below.
     ConvScreenInfo{ nullptr },
     ScrollScale{ 1ul },
     _pConsoleWindowMetrics{ pMetrics },
@@ -62,13 +61,6 @@ SCREEN_INFORMATION::SCREEN_INFORMATION(
     _currentFont{ fontInfo },
     _desiredFont{ fontInfo }
 {
-    LineChar[0] = UNICODE_BOX_DRAW_LIGHT_DOWN_AND_RIGHT;
-    LineChar[1] = UNICODE_BOX_DRAW_LIGHT_DOWN_AND_LEFT;
-    LineChar[2] = UNICODE_BOX_DRAW_LIGHT_HORIZONTAL;
-    LineChar[3] = UNICODE_BOX_DRAW_LIGHT_VERTICAL;
-    LineChar[4] = UNICODE_BOX_DRAW_LIGHT_UP_AND_RIGHT;
-    LineChar[5] = UNICODE_BOX_DRAW_LIGHT_UP_AND_LEFT;
-
     // Check if VT mode is enabled. Note that this can be true w/o calling
     // SetConsoleMode, if VirtualTerminalLevel is set to !=0 in the registry.
     const CONSOLE_INFORMATION& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
@@ -111,10 +103,10 @@ SCREEN_INFORMATION::~SCREEN_INFORMATION()
     try
     {
         IWindowMetrics* pMetrics = ServiceLocator::LocateWindowMetrics();
-        THROW_IF_NULL_ALLOC(pMetrics);
+        THROW_HR_IF_NULL(E_FAIL, pMetrics);
 
         IAccessibilityNotifier* pNotifier = ServiceLocator::LocateAccessibilityNotifier();
-        THROW_IF_NULL_ALLOC(pNotifier);
+        THROW_HR_IF_NULL(E_FAIL, pNotifier);
 
         SCREEN_INFORMATION* const pScreen = new SCREEN_INFORMATION(pMetrics, pNotifier, popupAttributes, fontInfo);
 
@@ -135,7 +127,7 @@ SCREEN_INFORMATION::~SCREEN_INFORMATION()
 
         const NTSTATUS status = pScreen->_InitializeOutputStateMachine();
 
-        if (pScreen->InVTMode())
+        if (pScreen->_IsInVTMode())
         {
             // microsoft/terminal#411: If VT mode is enabled, lets construct the
             // VT tab stops. Without this line, if a user has
@@ -169,7 +161,7 @@ Viewport SCREEN_INFORMATION::GetBufferSize() const
 //      Scrolling mode, this will return our Y dimension as only extending up to
 //      the _virtualBottom. The height of the returned viewport would then be
 //      (number of lines in scrollback) + (number of lines in viewport).
-//   If we're not in teminal scrolling mode, this will return our normal buffer
+//   If we're not in terminal scrolling mode, this will return our normal buffer
 //      size.
 // Arguments:
 // - <none>
@@ -197,17 +189,6 @@ const StateMachine& SCREEN_INFORMATION::GetStateMachine() const
 StateMachine& SCREEN_INFORMATION::GetStateMachine()
 {
     return *_stateMachine;
-}
-
-// Method Description:
-// - returns true if this buffer is in Virtual Terminal Output mode.
-// Arguments:
-// <none>
-// Return Value:
-// true iff this buffer is in Virtual Terminal Output mode.
-bool SCREEN_INFORMATION::InVTMode() const
-{
-    return WI_IsFlagSet(OutputMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING);
 }
 
 // Routine Description:
@@ -283,15 +264,14 @@ void SCREEN_INFORMATION::s_RemoveScreenBuffer(_In_ SCREEN_INFORMATION* const pSc
 {
     try
     {
-        auto adapter = std::make_unique<AdaptDispatch>(new ConhostInternalGetSet{ *this },
-                                                       new WriteBuffer{ *this });
-        THROW_IF_NULL_ALLOC(adapter.get());
-
+        auto getset = std::make_unique<ConhostInternalGetSet>(*this);
+        auto defaults = std::make_unique<WriteBuffer>(*this);
+        auto adapter = std::make_unique<AdaptDispatch>(std::move(getset), std::move(defaults));
+        auto engine = std::make_unique<OutputStateMachineEngine>(std::move(adapter));
         // Note that at this point in the setup, we haven't determined if we're
         //      in VtIo mode or not yet. We'll set the OutputStateMachine's
         //      TerminalConnection later, in VtIo::StartIfNeeded
-        _stateMachine = std::make_shared<StateMachine>(new OutputStateMachineEngine(adapter.release()));
-        THROW_IF_NULL_ALLOC(_stateMachine.get());
+        _stateMachine = std::make_shared<StateMachine>(std::move(engine));
     }
     catch (...)
     {
@@ -1434,224 +1414,21 @@ bool SCREEN_INFORMATION::IsMaximizedY() const
     // Save cursor's relative height versus the viewport
     SHORT const sCursorHeightInViewportBefore = _textBuffer->GetCursor().GetPosition().Y - _viewport.Top();
 
-    Cursor& oldCursor = _textBuffer->GetCursor();
-    Cursor& newCursor = newTextBuffer->GetCursor();
-    // skip any drawing updates that might occur as we manipulate the new buffer
-    oldCursor.StartDeferDrawing();
-    newCursor.StartDeferDrawing();
+    HRESULT hr = TextBuffer::Reflow(*_textBuffer.get(), *newTextBuffer.get());
 
-    // We need to save the old cursor position so that we can
-    // place the new cursor back on the equivalent character in
-    // the new buffer.
-    COORD cOldCursorPos = oldCursor.GetPosition();
-    COORD cOldLastChar = _textBuffer->GetLastNonSpaceCharacter();
-
-    short const cOldRowsTotal = cOldLastChar.Y + 1;
-    short const cOldColsTotal = GetBufferSize().Width();
-
-    COORD cNewCursorPos = { 0 };
-    bool fFoundCursorPos = false;
-
-    NTSTATUS status = STATUS_SUCCESS;
-    // Loop through all the rows of the old buffer and reprint them into the new buffer
-    for (short iOldRow = 0; iOldRow < cOldRowsTotal; iOldRow++)
+    if (SUCCEEDED(hr))
     {
-        // Fetch the row and its "right" which is the last printable character.
-        const ROW& Row = _textBuffer->GetRowByOffset(iOldRow);
-        const CharRow& charRow = Row.GetCharRow();
-        short iRight = static_cast<short>(charRow.MeasureRight());
-
-        // There is a special case here. If the row has a "wrap"
-        // flag on it, but the right isn't equal to the width (one
-        // index past the final valid index in the row) then there
-        // were a bunch trailing of spaces in the row.
-        // (But the measuring functions for each row Left/Right do
-        // not count spaces as "displayable" so they're not
-        // included.)
-        // As such, adjust the "right" to be the width of the row
-        // to capture all these spaces
-        if (charRow.WasWrapForced())
-        {
-            iRight = cOldColsTotal;
-
-            // And a combined special case.
-            // If we wrapped off the end of the row by adding a
-            // piece of padding because of a double byte LEADING
-            // character, then remove one from the "right" to
-            // leave this padding out of the copy process.
-            if (charRow.WasDoubleBytePadded())
-            {
-                iRight--;
-            }
-        }
-
-        // Loop through every character in the current row (up to
-        // the "right" boundary, which is one past the final valid
-        // character)
-        for (short iOldCol = 0; iOldCol < iRight; iOldCol++)
-        {
-            if (iOldCol == cOldCursorPos.X && iOldRow == cOldCursorPos.Y)
-            {
-                cNewCursorPos = newCursor.GetPosition();
-                fFoundCursorPos = true;
-            }
-
-            try
-            {
-                // TODO: MSFT: 19446208 - this should just use an iterator and the inserter...
-                const auto glyph = Row.GetCharRow().GlyphAt(iOldCol);
-                const auto dbcsAttr = Row.GetCharRow().DbcsAttrAt(iOldCol);
-                const auto textAttr = Row.GetAttrRow().GetAttrByColumn(iOldCol);
-
-                if (!newTextBuffer->InsertCharacter(glyph, dbcsAttr, textAttr))
-                {
-                    status = STATUS_NO_MEMORY;
-                    break;
-                }
-            }
-            catch (...)
-            {
-                return NTSTATUS_FROM_HRESULT(wil::ResultFromCaughtException());
-            }
-        }
-        if (NT_SUCCESS(status))
-        {
-            // If we didn't have a full row to copy, insert a new
-            // line into the new buffer.
-            // Only do so if we were not forced to wrap. If we did
-            // force a word wrap, then the existing line break was
-            // only because we ran out of space.
-            if (iRight < cOldColsTotal && !charRow.WasWrapForced())
-            {
-                if (iRight == cOldCursorPos.X && iOldRow == cOldCursorPos.Y)
-                {
-                    cNewCursorPos = newCursor.GetPosition();
-                    fFoundCursorPos = true;
-                }
-                // Only do this if it's not the final line in the buffer.
-                // On the final line, we want the cursor to sit
-                // where it is done printing for the cursor
-                // adjustment to follow.
-                if (iOldRow < cOldRowsTotal - 1)
-                {
-                    status = newTextBuffer->NewlineCursor() ? status : STATUS_NO_MEMORY;
-                }
-                else
-                {
-                    // If we are on the final line of the buffer, we have one more check.
-                    // We got into this code path because we are at the right most column of a row in the old buffer
-                    // that had a hard return (no wrap was forced).
-                    // However, as we're inserting, the old row might have just barely fit into the new buffer and
-                    // caused a new soft return (wrap was forced) putting the cursor at x=0 on the line just below.
-                    // We need to preserve the memory of the hard return at this point by inserting one additional
-                    // hard newline, otherwise we've lost that information.
-                    // We only do this when the cursor has just barely poured over onto the next line so the hard return
-                    // isn't covered by the soft one.
-                    // e.g.
-                    // The old line was:
-                    // |aaaaaaaaaaaaaaaaaaa | with no wrap which means there was a newline after that final a.
-                    // The cursor was here ^
-                    // And the new line will be:
-                    // |aaaaaaaaaaaaaaaaaaa| and show a wrap at the end
-                    // |                   |
-                    //  ^ and the cursor is now there.
-                    // If we leave it like this, we've lost the newline information.
-                    // So we insert one more newline so a continued reflow of this buffer by resizing larger will
-                    // continue to look as the original output intended with the newline data.
-                    // After this fix, it looks like this:
-                    // |aaaaaaaaaaaaaaaaaaa| no wrap at the end (preserved hard newline)
-                    // |                   |
-                    //  ^ and the cursor is now here.
-                    const COORD coordNewCursor = newCursor.GetPosition();
-                    if (coordNewCursor.X == 0 && coordNewCursor.Y > 0)
-                    {
-                        if (newTextBuffer->GetRowByOffset(coordNewCursor.Y - 1).GetCharRow().WasWrapForced())
-                        {
-                            status = newTextBuffer->NewlineCursor() ? status : STATUS_NO_MEMORY;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if (NT_SUCCESS(status))
-    {
-        // Finish copying remaining parameters from the old text buffer to the new one
-        newTextBuffer->CopyProperties(*_textBuffer);
-
-        // If we found where to put the cursor while placing characters into the buffer,
-        //   just put the cursor there. Otherwise we have to advance manually.
-        if (fFoundCursorPos)
-        {
-            newCursor.SetPosition(cNewCursorPos);
-        }
-        else
-        {
-            // Advance the cursor to the same offset as before
-            // get the number of newlines and spaces between the old end of text and the old cursor,
-            //   then advance that many newlines and chars
-            int iNewlines = cOldCursorPos.Y - cOldLastChar.Y;
-            int iIncrements = cOldCursorPos.X - cOldLastChar.X;
-            const COORD cNewLastChar = newTextBuffer->GetLastNonSpaceCharacter();
-
-            // If the last row of the new buffer wrapped, there's going to be one less newline needed,
-            //   because the cursor is already on the next line
-            if (newTextBuffer->GetRowByOffset(cNewLastChar.Y).GetCharRow().WasWrapForced())
-            {
-                iNewlines = std::max(iNewlines - 1, 0);
-            }
-            else
-            {
-                // if this buffer didn't wrap, but the old one DID, then the d(columns) of the
-                //   old buffer will be one more than in this buffer, so new need one LESS.
-                if (_textBuffer->GetRowByOffset(cOldLastChar.Y).GetCharRow().WasWrapForced())
-                {
-                    iNewlines = std::max(iNewlines - 1, 0);
-                }
-            }
-
-            for (int r = 0; r < iNewlines; r++)
-            {
-                if (!newTextBuffer->NewlineCursor())
-                {
-                    status = STATUS_NO_MEMORY;
-                    break;
-                }
-            }
-            if (NT_SUCCESS(status))
-            {
-                for (int c = 0; c < iIncrements - 1; c++)
-                {
-                    if (!newTextBuffer->IncrementCursor())
-                    {
-                        status = STATUS_NO_MEMORY;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if (NT_SUCCESS(status))
-    {
+        Cursor& newCursor = newTextBuffer->GetCursor();
         // Adjust the viewport so the cursor doesn't wildly fly off up or down.
         SHORT const sCursorHeightInViewportAfter = newCursor.GetPosition().Y - _viewport.Top();
         COORD coordCursorHeightDiff = { 0 };
         coordCursorHeightDiff.Y = sCursorHeightInViewportAfter - sCursorHeightInViewportBefore;
         LOG_IF_FAILED(SetViewportOrigin(false, coordCursorHeightDiff, true));
 
-        // Save old cursor size before we delete it
-        ULONG const ulSize = oldCursor.GetSize();
-
         _textBuffer.swap(newTextBuffer);
-
-        // Set size back to real size as it will be taking over the rendering duties.
-        newCursor.SetSize(ulSize);
-        newCursor.EndDeferDrawing();
     }
-    oldCursor.EndDeferDrawing();
 
-    return status;
+    return NTSTATUS_FROM_HRESULT(hr);
 }
 
 //
@@ -2025,9 +1802,9 @@ const SCREEN_INFORMATION& SCREEN_INFORMATION::GetMainBuffer() const
 //     machine with the main buffer it belongs to.
 // TODO: MSFT:19817348 Don't create alt screenbuffer's via an out SCREEN_INFORMATION**
 // Parameters:
-// - ppsiNewScreenBuffer - a pointer to recieve the newly created buffer.
+// - ppsiNewScreenBuffer - a pointer to receive the newly created buffer.
 // Return value:
-// - STATUS_SUCCESS if handled successfully. Otherwise, an approriate status code indicating the error.
+// - STATUS_SUCCESS if handled successfully. Otherwise, an appropriate status code indicating the error.
 [[nodiscard]] NTSTATUS SCREEN_INFORMATION::_CreateAltBuffer(_Out_ SCREEN_INFORMATION** const ppsiNewScreenBuffer)
 {
     // Create new screen buffer.
@@ -2035,12 +1812,17 @@ const SCREEN_INFORMATION& SCREEN_INFORMATION::GetMainBuffer() const
 
     const FontInfo& existingFont = GetCurrentFont();
 
+    // The buffer needs to be initialized with the standard erase attributes,
+    // i.e. the current background color, but with no meta attributes set.
+    auto initAttributes = GetAttributes();
+    initAttributes.SetStandardErase();
+
     NTSTATUS Status = SCREEN_INFORMATION::CreateInstance(WindowSize,
                                                          existingFont,
                                                          WindowSize,
-                                                         GetAttributes(),
+                                                         initAttributes,
                                                          *GetPopupAttributes(),
-                                                         CURSOR_SMALL_SIZE,
+                                                         Cursor::CURSOR_SMALL_SIZE,
                                                          ppsiNewScreenBuffer);
     if (NT_SUCCESS(Status))
     {
@@ -2071,7 +1853,7 @@ const SCREEN_INFORMATION& SCREEN_INFORMATION::GetMainBuffer() const
 // Parameters:
 // - None
 // Return value:
-// - STATUS_SUCCESS if handled successfully. Otherwise, an approriate status code indicating the error.
+// - STATUS_SUCCESS if handled successfully. Otherwise, an appropriate status code indicating the error.
 [[nodiscard]] NTSTATUS SCREEN_INFORMATION::UseAlternateScreenBuffer()
 {
     CONSOLE_INFORMATION& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
@@ -2118,7 +1900,7 @@ const SCREEN_INFORMATION& SCREEN_INFORMATION::GetMainBuffer() const
 // Parameters:
 // - None
 // Return value:
-// - STATUS_SUCCESS if handled successfully. Otherwise, an approriate status code indicating the error.
+// - STATUS_SUCCESS if handled successfully. Otherwise, an appropriate status code indicating the error.
 void SCREEN_INFORMATION::UseMainScreenBuffer()
 {
     CONSOLE_INFORMATION& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
@@ -2172,6 +1954,17 @@ bool SCREEN_INFORMATION::_IsInPtyMode() const
 }
 
 // Routine Description:
+// - returns true if this buffer is in Virtual Terminal Output mode.
+// Parameters:
+// - None
+// Return Value:
+// - true iff this buffer is in Virtual Terminal Output mode.
+bool SCREEN_INFORMATION::_IsInVTMode() const
+{
+    return WI_IsFlagSet(OutputMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+}
+
+// Routine Description:
 // - Sets a VT tab stop in the column sColumn. If there is already a tab there, it does nothing.
 // Parameters:
 // - sColumn: the column to add a tab stop to.
@@ -2219,12 +2012,7 @@ COORD SCREEN_INFORMATION::GetForwardTab(const COORD cCurrCursorPos) const noexce
 {
     COORD cNewCursorPos = cCurrCursorPos;
     SHORT sWidth = GetBufferSize().RightInclusive();
-    if (cCurrCursorPos.X == sWidth)
-    {
-        cNewCursorPos.X = 0;
-        cNewCursorPos.Y += 1;
-    }
-    else if (_tabStops.empty() || cCurrCursorPos.X >= _tabStops.back())
+    if (_tabStops.empty() || cCurrCursorPos.X >= _tabStops.back())
     {
         cNewCursorPos.X = sWidth;
     }
@@ -2235,7 +2023,8 @@ COORD SCREEN_INFORMATION::GetForwardTab(const COORD cCurrCursorPos) const noexce
         {
             if (*it > cCurrCursorPos.X)
             {
-                cNewCursorPos.X = *it;
+                // make sure we don't exceed the width of the buffer
+                cNewCursorPos.X = std::min(*it, sWidth);
                 break;
             }
         }
@@ -2501,18 +2290,23 @@ void SCREEN_INFORMATION::SetViewport(const Viewport& newViewport,
     _viewport.ConvertFromOrigin(&relativeCursor);
     RETURN_IF_FAILED(SetCursorPosition(relativeCursor, false));
 
-    // Update all the rows in the current viewport with the currently active attributes.
-    OutputCellIterator it(GetAttributes());
-    WriteRect(it, _viewport);
+    // Update all the rows in the current viewport with the standard erase attributes,
+    // i.e. the current background color, but with no meta attributes set.
+    auto fillAttributes = GetAttributes();
+    fillAttributes.SetStandardErase();
+    auto fillPosition = COORD{ 0, _viewport.Top() };
+    auto fillLength = gsl::narrow_cast<size_t>(_viewport.Height() * GetBufferSize().Width());
+    auto fillData = OutputCellIterator{ fillAttributes, fillLength };
+    Write(fillData, fillPosition, false);
 
     return S_OK;
 }
 
 // Method Description:
 // - Sets up the Output state machine to be in pty mode. Sequences it doesn't
-//      understand will be written to tthe pTtyConnection passed in here.
+//      understand will be written to the pTtyConnection passed in here.
 // Arguments:
-// - pTtyConnection: This is a TerminaOutputConnection that we can write the
+// - pTtyConnection: This is a TerminalOutputConnection that we can write the
 //      sequence we didn't understand to.
 // Return Value:
 // - <none>
@@ -2801,7 +2595,7 @@ void SCREEN_INFORMATION::UpdateBottom()
 }
 
 // Method Description:
-// - Initialize the row with the cursor on it to the current text attributes.
+// - Initialize the row with the cursor on it to the standard erase attributes.
 //      This is executed when we move the cursor below the current viewport in
 //      VT mode. When that happens in a real terminal, the line is brand new,
 //      so it gets initialized for the first time with the current attributes.
@@ -2818,7 +2612,11 @@ void SCREEN_INFORMATION::InitializeCursorRowAttributes()
     {
         const auto& cursor = _textBuffer->GetCursor();
         ROW& row = _textBuffer->GetRowByOffset(cursor.GetPosition().Y);
-        row.GetAttrRow().SetAttrToEnd(0, GetAttributes());
+        // The VT standard requires that the new row is initialized with
+        // the current background color, but with no meta attributes set.
+        auto fillAttributes = GetAttributes();
+        fillAttributes.SetStandardErase();
+        row.GetAttrRow().SetAttrToEnd(0, fillAttributes);
     }
 }
 
@@ -2901,7 +2699,7 @@ const FontInfo& SCREEN_INFORMATION::GetCurrentFont() const noexcept
 // Method Description:
 // - Gets the desired font of the screen buffer. If we try loading this font and
 //      have to fallback to another, then GetCurrentFont()!=GetDesiredFont().
-//      We store this seperately, so that if we need to reload the font, we can
+//      We store this separately, so that if we need to reload the font, we can
 //      try again with our prefered font info (in the desired font info) instead
 //      of re-using the looked up value from before.
 // Arguments:

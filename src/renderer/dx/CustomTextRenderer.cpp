@@ -272,13 +272,21 @@ using namespace Microsoft::Console::Render;
 
     rect.right = std::accumulate(advancesSpan.cbegin(), advancesSpan.cend(), rect.right);
 
+    // Clip all drawing in this glyph run to where we expect.
+    d2dContext->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    // Ensure we pop it on the way out
+    auto popclip = wil::scope_exit([&d2dContext]() noexcept {
+        d2dContext->PopAxisAlignedClip();
+    });
+
     d2dContext->FillRectangle(rect, drawingContext->backgroundBrush);
 
     // Now go onto drawing the text.
 
     // First check if we want a color font and try to extract color emoji first.
     // Color emoji are only available on Windows 10+
-    if (WI_IsFlagSet(drawingContext->options, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT) && IsWindows10OrGreater())
+    static const bool s_isWindows10OrGreater = IsWindows10OrGreater();
+    if (WI_IsFlagSet(drawingContext->options, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT) && s_isWindows10OrGreater)
     {
         ::Microsoft::WRL::ComPtr<ID2D1DeviceContext4> d2dContext4;
         RETURN_IF_FAILED(d2dContext.As(&d2dContext4));

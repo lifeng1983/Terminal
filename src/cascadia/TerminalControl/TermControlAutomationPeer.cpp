@@ -11,6 +11,7 @@
 
 using namespace Microsoft::Console::Types;
 using namespace winrt::Windows::UI::Xaml::Automation::Peers;
+using namespace winrt::Windows::Graphics::Display;
 
 namespace UIA
 {
@@ -27,9 +28,54 @@ namespace XamlAutomation
 
 namespace winrt::Microsoft::Terminal::TerminalControl::implementation
 {
-    TermControlAutomationPeer::TermControlAutomationPeer(winrt::Microsoft::Terminal::TerminalControl::implementation::TermControl const& owner) :
-        TermControlAutomationPeerT<TermControlAutomationPeer>(owner), // pass owner to FrameworkElementAutomationPeer
-        _uiaProvider{ owner, std::bind(&TermControlAutomationPeer::GetBoundingRectWrapped, this) } {};
+    TermControlAutomationPeer::TermControlAutomationPeer(winrt::Microsoft::Terminal::TerminalControl::implementation::TermControl* owner) :
+        TermControlAutomationPeerT<TermControlAutomationPeer>(*owner), // pass owner to FrameworkElementAutomationPeer
+        _termControl{ owner }
+    {
+        THROW_IF_FAILED(::Microsoft::WRL::MakeAndInitialize<::Microsoft::Terminal::TermControlUiaProvider>(&_uiaProvider, _termControl->GetUiaData(), this));
+    };
+
+    // Method Description:
+    // - Signals the ui automation client that the terminal's selection has changed and should be updated
+    // Arguments:
+    // - <none>
+    // Return Value:
+    // - <none>
+    void TermControlAutomationPeer::SignalSelectionChanged()
+    {
+        Dispatcher().RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal, [&]() {
+            // The event that is raised when the text selection is modified.
+            RaiseAutomationEvent(AutomationEvents::TextPatternOnTextSelectionChanged);
+        });
+    }
+
+    // Method Description:
+    // - Signals the ui automation client that the terminal's output has changed and should be updated
+    // Arguments:
+    // - <none>
+    // Return Value:
+    // - <none>
+    void TermControlAutomationPeer::SignalTextChanged()
+    {
+        Dispatcher().RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal, [&]() {
+            // The event that is raised when textual content is modified.
+            RaiseAutomationEvent(AutomationEvents::TextPatternOnTextChanged);
+        });
+    }
+
+    // Method Description:
+    // - Signals the ui automation client that the cursor's state has changed and should be updated
+    // Arguments:
+    // - <none>
+    // Return Value:
+    // - <none>
+    void TermControlAutomationPeer::SignalCursorChanged()
+    {
+        Dispatcher().RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal, [&]() {
+            // The event that is raised when the text was changed in an edit control.
+            RaiseAutomationEvent(AutomationEvents::TextEditTextChanged);
+        });
+    }
 
     winrt::hstring TermControlAutomationPeer::GetClassNameCore() const
     {
@@ -63,14 +109,14 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
     winrt::com_array<XamlAutomation::ITextRangeProvider> TermControlAutomationPeer::GetSelection()
     {
         SAFEARRAY* pReturnVal;
-        THROW_IF_FAILED(_uiaProvider.GetSelection(&pReturnVal));
+        THROW_IF_FAILED(_uiaProvider->GetSelection(&pReturnVal));
         return WrapArrayOfTextRangeProviders(pReturnVal);
     }
 
     winrt::com_array<XamlAutomation::ITextRangeProvider> TermControlAutomationPeer::GetVisibleRanges()
     {
         SAFEARRAY* pReturnVal;
-        THROW_IF_FAILED(_uiaProvider.GetVisibleRanges(&pReturnVal));
+        THROW_IF_FAILED(_uiaProvider->GetVisibleRanges(&pReturnVal));
         return WrapArrayOfTextRangeProviders(pReturnVal);
     }
 
@@ -78,8 +124,8 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
     {
         UIA::ITextRangeProvider* returnVal;
         // ScreenInfoUiaProvider doesn't actually use parameter, so just pass in nullptr
-        THROW_IF_FAILED(_uiaProvider.RangeFromChild(/* IRawElementProviderSimple */ nullptr,
-                                                    &returnVal));
+        THROW_IF_FAILED(_uiaProvider->RangeFromChild(/* IRawElementProviderSimple */ nullptr,
+                                                     &returnVal));
 
         auto parentProvider = this->ProviderFromPeer(*this);
         auto xutr = winrt::make_self<XamlUiaTextRange>(returnVal, parentProvider);
@@ -89,7 +135,7 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
     XamlAutomation::ITextRangeProvider TermControlAutomationPeer::RangeFromPoint(Windows::Foundation::Point screenLocation)
     {
         UIA::ITextRangeProvider* returnVal;
-        THROW_IF_FAILED(_uiaProvider.RangeFromPoint({ screenLocation.X, screenLocation.Y }, &returnVal));
+        THROW_IF_FAILED(_uiaProvider->RangeFromPoint({ screenLocation.X, screenLocation.Y }, &returnVal));
 
         auto parentProvider = this->ProviderFromPeer(*this);
         auto xutr = winrt::make_self<XamlUiaTextRange>(returnVal, parentProvider);
@@ -99,7 +145,7 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
     XamlAutomation::ITextRangeProvider TermControlAutomationPeer::DocumentRange()
     {
         UIA::ITextRangeProvider* returnVal;
-        THROW_IF_FAILED(_uiaProvider.get_DocumentRange(&returnVal));
+        THROW_IF_FAILED(_uiaProvider->get_DocumentRange(&returnVal));
 
         auto parentProvider = this->ProviderFromPeer(*this);
         auto xutr = winrt::make_self<XamlUiaTextRange>(returnVal, parentProvider);
@@ -109,13 +155,19 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
     Windows::UI::Xaml::Automation::SupportedTextSelection TermControlAutomationPeer::SupportedTextSelection()
     {
         UIA::SupportedTextSelection returnVal;
-        THROW_IF_FAILED(_uiaProvider.get_SupportedTextSelection(&returnVal));
+        THROW_IF_FAILED(_uiaProvider->get_SupportedTextSelection(&returnVal));
         return static_cast<XamlAutomation::SupportedTextSelection>(returnVal);
     }
 
 #pragma endregion
 
-    RECT TermControlAutomationPeer::GetBoundingRectWrapped()
+#pragma region IControlAccessibilityInfo
+    COORD TermControlAutomationPeer::GetFontSize() const
+    {
+        return _termControl->GetActualFont().GetSize();
+    }
+
+    RECT TermControlAutomationPeer::GetBounds() const
     {
         auto rect = GetBoundingRectangle();
         return {
@@ -126,6 +178,36 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
         };
     }
 
+    HRESULT TermControlAutomationPeer::GetHostUiaProvider(IRawElementProviderSimple** provider)
+    {
+        RETURN_HR_IF(E_INVALIDARG, provider == nullptr);
+        *provider = nullptr;
+
+        return S_OK;
+    }
+
+    RECT TermControlAutomationPeer::GetPadding() const
+    {
+        auto padding = _termControl->GetPadding();
+        return {
+            gsl::narrow_cast<LONG>(padding.Left),
+            gsl::narrow_cast<LONG>(padding.Top),
+            gsl::narrow_cast<LONG>(padding.Right),
+            gsl::narrow_cast<LONG>(padding.Bottom)
+        };
+    }
+
+    double TermControlAutomationPeer::GetScaleFactor() const
+    {
+        return DisplayInformation::GetForCurrentView().RawPixelsPerViewPixel();
+    }
+
+    void TermControlAutomationPeer::ChangeViewport(const SMALL_RECT NewWindow)
+    {
+        _termControl->ScrollViewport(NewWindow.Top);
+    }
+#pragma endregion
+
     // Method Description:
     // - extracts the UiaTextRanges from the SAFEARRAY and converts them to Xaml ITextRangeProviders
     // Arguments:
@@ -135,7 +217,7 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
     winrt::com_array<XamlAutomation::ITextRangeProvider> TermControlAutomationPeer::WrapArrayOfTextRangeProviders(SAFEARRAY* textRanges)
     {
         // transfer ownership of UiaTextRanges to this new vector
-        auto providers = SafeArrayToOwningVector<::Microsoft::Terminal::UiaTextRange>(textRanges);
+        auto providers = SafeArrayToOwningVector<::Microsoft::Terminal::TermControlUiaTextRange>(textRanges);
         int count = gsl::narrow<int>(providers.size());
 
         std::vector<XamlAutomation::ITextRangeProvider> vec;

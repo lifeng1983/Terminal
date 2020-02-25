@@ -28,7 +28,6 @@ namespace Microsoft::Console::Render
     {
     public:
         XtermEngine(_In_ wil::unique_hfile hPipe,
-                    wil::shared_event shutdownEvent,
                     const Microsoft::Console::IDefaultColorProvider& colorProvider,
                     const Microsoft::Console::Types::Viewport initialViewport,
                     _In_reads_(cColorTable) const COLORREF* const ColorTable,
@@ -45,7 +44,7 @@ namespace Microsoft::Console::Render
         [[nodiscard]] virtual HRESULT UpdateDrawingBrushes(const COLORREF colorForeground,
                                                            const COLORREF colorBackground,
                                                            const WORD legacyColorAttribute,
-                                                           const bool isBold,
+                                                           const ExtendedAttributes extendedAttrs,
                                                            const bool isSettingDefaultBrushes) noexcept override;
         [[nodiscard]] HRESULT PaintBufferLine(std::basic_string_view<Cluster> const clusters,
                                               const COORD coord,
@@ -54,7 +53,7 @@ namespace Microsoft::Console::Render
 
         [[nodiscard]] HRESULT InvalidateScroll(const COORD* const pcoordDelta) noexcept override;
 
-        [[nodiscard]] HRESULT WriteTerminalW(_In_ const std::wstring& str) noexcept override;
+        [[nodiscard]] HRESULT WriteTerminalW(const std::wstring_view str) noexcept override;
 
     protected:
         const COLORREF* const _ColorTable;
@@ -74,6 +73,7 @@ namespace Microsoft::Console::Render
 
 #ifdef UNIT_TESTING
         friend class VtRendererTest;
+        friend class ConptyOutputTests;
 #endif
     };
 }

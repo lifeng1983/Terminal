@@ -12,6 +12,7 @@
 
 // defaults.h is a file containing the default json settings in a std::string_view
 #include "defaults.h"
+#include "defaults-universal.h"
 // userDefault.h is like the above, but with a default template for the user's profiles.json.
 #include "userDefaults.h"
 // Both defaults.h and userDefaults.h are generated at build time into the
@@ -29,6 +30,8 @@ static constexpr std::wstring_view DefaultsFilename{ L"defaults.json" };
 
 static constexpr std::string_view SchemaKey{ "$schema" };
 static constexpr std::string_view ProfilesKey{ "profiles" };
+static constexpr std::string_view DefaultSettingsKey{ "defaults" };
+static constexpr std::string_view ProfilesListKey{ "list" };
 static constexpr std::string_view KeybindingsKey{ "keybindings" };
 static constexpr std::string_view GlobalsKey{ "globals" };
 static constexpr std::string_view SchemesKey{ "schemes" };
@@ -36,7 +39,6 @@ static constexpr std::string_view SchemesKey{ "schemes" };
 static constexpr std::string_view DisabledProfileSourcesKey{ "disabledProfileSources" };
 
 static constexpr std::string_view Utf8Bom{ u8"\uFEFF" };
-static constexpr std::string_view DefaultProfilesIndentation{ "        " };
 static constexpr std::string_view SettingsSchemaFragment{ "\n"
                                                           R"(    "$schema": "https://aka.ms/terminal-profiles-schema")" };
 
@@ -55,6 +57,11 @@ static constexpr std::string_view SettingsSchemaFragment{ "\n"
 std::unique_ptr<CascadiaSettings> CascadiaSettings::LoadAll()
 {
     auto resultPtr = LoadDefaults();
+
+    // GH 3588, we need this below to know if the user chose something that wasn't our default.
+    // Collect it up here in case it gets modified by any of the other layers between now and when
+    // the user's preferences are loaded and layered.
+    const auto hardcodedDefaultGuid = resultPtr->GlobalSettings().GetDefaultProfile();
 
     std::optional<std::string> fileData = _ReadUserSettings();
     const bool foundFile = fileData.has_value();
@@ -80,6 +87,14 @@ std::unique_ptr<CascadiaSettings> CascadiaSettings::LoadAll()
     // created by now, because we're going to check in there for any generators
     // that should be disabled.
     resultPtr->_LoadDynamicProfiles();
+
+    // See microsoft/terminal#2325: find the defaultSettings from the user's
+    // settings. Layer those settings upon all the existing profiles we have
+    // (defaults and dynamic profiles). We'll also set
+    // _userDefaultProfileSettings here. When we LayerJson below to apply the
+    // user settings, we'll make sure to use these defaultSettings _before_ any
+    // profiles the user might have.
+    resultPtr->_ApplyDefaultsFromUserSettings();
 
     // Apply the user's settings
     resultPtr->LayerJson(resultPtr->_userSettings);
@@ -115,6 +130,80 @@ std::unique_ptr<CascadiaSettings> CascadiaSettings::LoadAll()
         _WriteSettings(resultPtr->_userSettingsString);
     }
 
+    // If this throws, the app will catch it and use the default settings
+    resultPtr->_ValidateSettings();
+
+    // GH 3855 - Gathering Data on custom profiles to inform better defaults
+    // Do it after everything else so it won't happen unless validation passed.
+    // Also, avoid processing unless someone's listening for measures. The keybindings work, at least,
+    // is a lot of computation we can skip if no one cares.
+    if (TraceLoggingProviderEnabled(g_hTerminalAppProvider, 0, MICROSOFT_KEYWORD_MEASURES))
+    {
+        auto guid = resultPtr->GlobalSettings().GetDefaultProfile();
+
+        // Compare to the defaults.json one that we set on install.
+        // If it's different, log what the user chose.
+        if (hardcodedDefaultGuid != guid)
+        {
+            TraceLoggingWrite(
+                g_hTerminalAppProvider, // handle to TerminalApp tracelogging provider
+                "CustomDefaultProfile",
+                TraceLoggingDescription("Event emitted when user has chosen a different default profile than hardcoded one on load/reload"),
+                TraceLoggingGuid(guid, "DefaultProfile", "ID of user-chosen default profile"),
+                TraceLoggingKeyword(MICROSOFT_KEYWORD_MEASURES),
+                TelemetryPrivacyDataTag(PDT_ProductAndServiceUsage));
+        }
+
+        // If the user had keybinding settings preferences, we want to learn from them to make better defaults
+        auto userKeybindings = resultPtr->_userSettings[JsonKey(KeybindingsKey)];
+        if (!userKeybindings.empty())
+        {
+            // If there are custom key bindings, let's understand what they are because maybe the defaults aren't good enough
+
+            // Run it through the object so we can parse it apart and then only serialize the fields we're interested in
+            // and avoid extraneous data.
+            auto akb = winrt::make_self<implementation::AppKeyBindings>();
+            akb->LayerJson(userKeybindings);
+            auto value = akb->ToJson();
+
+            // Reserialize the keybindings
+            Json::StreamWriterBuilder wbuilder;
+            // Use 4 spaces to indent instead of \t
+            wbuilder.settings_["indentation"] = "    ";
+            wbuilder.settings_["enableYAMLCompatibility"] = true; // suppress spaces around colons
+
+            const auto keybindingsString = Json::writeString(wbuilder, value);
+
+            TraceLoggingWrite(
+                g_hTerminalAppProvider, // handle to TerminalApp tracelogging provider
+                "CustomKeybindings",
+                TraceLoggingDescription("Event emitted when custom keybindings are idenfitied on load/reload"),
+                TraceLoggingUtf8String(keybindingsString.c_str(), "Keybindings", "Keybindings as JSON"),
+                TraceLoggingKeyword(MICROSOFT_KEYWORD_MEASURES),
+                TelemetryPrivacyDataTag(PDT_ProductAndServiceUsage));
+        }
+    }
+
+    return resultPtr;
+}
+
+// Function Description:
+// - Loads a batch of settings curated for the Universal variant of the terminal app
+// Arguments:
+// - <none>
+// Return Value:
+// - a unique_ptr to a CascadiaSettings with the connection types and settings for Universal terminal
+std::unique_ptr<CascadiaSettings> CascadiaSettings::LoadUniversal()
+{
+    // We're going to do this ourselves because we want to exclude almost everything
+    // from the special Universal-for-developers configuration
+
+    // Create settings and get the universal defaults loaded up.
+    auto resultPtr = std::make_unique<CascadiaSettings>();
+    resultPtr->_ParseJsonString(DefaultUniversalJson, true);
+    resultPtr->LayerJson(resultPtr->_defaultSettings);
+
+    // Now validate.
     // If this throws, the app will catch it and use the default settings
     resultPtr->_ValidateSettings();
 
@@ -216,7 +305,7 @@ void CascadiaSettings::_ParseJsonString(std::string_view fileData, const bool is
         actualDataStart += Utf8Bom.size();
     }
 
-    std::string errs; // This string will recieve any error text from failing to parse.
+    std::string errs; // This string will receive any error text from failing to parse.
     std::unique_ptr<Json::CharReader> reader{ Json::CharReaderBuilder::CharReaderBuilder().newCharReader() };
 
     // Parse the json data into either our defaults or user settings. We'll keep
@@ -238,26 +327,6 @@ void CascadiaSettings::_ParseJsonString(std::string_view fileData, const bool is
     {
         _userSettingsString = fileData;
     }
-}
-
-// Method Description:
-// - Serialize this settings structure, and save it to a file. The location of
-//      the file changes depending whether we're running as a packaged
-//      application or not.
-// Arguments:
-// - <none>
-// Return Value:
-// - <none>
-void CascadiaSettings::SaveAll() const
-{
-    const auto json = ToJson();
-    Json::StreamWriterBuilder wbuilder;
-    // Use 4 spaces to indent instead of \t
-    wbuilder.settings_["indentation"] = "    ";
-    wbuilder.settings_["enableYAMLCompatibility"] = true; // suppress spaces around colons
-    const auto serializedString = Json::writeString(wbuilder, json);
-
-    _WriteSettings(serializedString);
 }
 
 // Method Description:
@@ -344,6 +413,11 @@ bool CascadiaSettings::_AppendDynamicProfilesToUserSettings()
     const auto numProfiles = userProfilesObj.size();
     const auto lastProfile = userProfilesObj[numProfiles - 1];
     size_t currentInsertIndex = lastProfile.getOffsetLimit();
+    // Find the position of the first non-tab/space character before the last profile...
+    const auto lastProfileIndentStartsAt{ _userSettingsString.find_last_not_of(" \t", lastProfile.getOffsetStart() - 1) };
+    // ... and impute the user's preferred indentation.
+    // (we're taking a copy because a string_view into a string we mutate is a no-no.)
+    const std::string indentation{ _userSettingsString, lastProfileIndentStartsAt + 1, lastProfile.getOffsetStart() - lastProfileIndentStartsAt - 1 };
 
     bool changedFile = false;
 
@@ -374,17 +448,17 @@ bool CascadiaSettings::_AppendDynamicProfilesToUserSettings()
         const auto diff = profile.GenerateStub();
         auto profileSerialization = Json::writeString(wbuilder, diff);
 
-        // Add 8 spaces to the start of each line
-        profileSerialization.insert(0, DefaultProfilesIndentation);
+        // Add the user's indent to the start of each line
+        profileSerialization.insert(0, indentation);
         // Get the first newline
         size_t pos = profileSerialization.find("\n");
         // for each newline...
         while (pos != std::string::npos)
         {
             // Insert 8 spaces immediately following the current newline
-            profileSerialization.insert(pos + 1, DefaultProfilesIndentation);
+            profileSerialization.insert(pos + 1, indentation);
             // Get the next newline
-            pos = profileSerialization.find("\n", pos + 9);
+            pos = profileSerialization.find("\n", pos + indentation.size() + 1);
         }
 
         // Write a comma, newline to the file
@@ -400,36 +474,6 @@ bool CascadiaSettings::_AppendDynamicProfilesToUserSettings()
     }
 
     return changedFile;
-}
-
-// Method Description:
-// - Serialize this object to a JsonObject.
-// Arguments:
-// - <none>
-// Return Value:
-// - a JsonObject which is an equivalent serialization of this object.
-Json::Value CascadiaSettings::ToJson() const
-{
-    Json::Value root;
-
-    Json::Value profilesArray;
-    for (const auto& profile : _profiles)
-    {
-        profilesArray.append(profile.ToJson());
-    }
-
-    Json::Value schemesArray;
-    const auto& colorSchemes = _globals.GetColorSchemes();
-    for (auto& scheme : colorSchemes)
-    {
-        schemesArray.append(scheme.ToJson());
-    }
-
-    root[GlobalsKey.data()] = _globals.ToJson();
-    root[ProfilesKey.data()] = profilesArray;
-    root[SchemesKey.data()] = schemesArray;
-
-    return root;
 }
 
 // Method Description:
@@ -457,19 +501,17 @@ std::unique_ptr<CascadiaSettings> CascadiaSettings::FromJson(const Json::Value& 
 // <none>
 void CascadiaSettings::LayerJson(const Json::Value& json)
 {
+    // microsoft/terminal#2906: First layer the root object as our globals. If
+    // there is also a `globals` object, layer that one on top of the settings
+    // from the root.
+    _globals.LayerJson(json);
+
     if (auto globals{ json[GlobalsKey.data()] })
     {
         if (globals.isObject())
         {
             _globals.LayerJson(globals);
         }
-    }
-    else
-    {
-        // If there's no globals key in the root object, then try looking at the
-        // root object for those properties instead, to gracefully upgrade.
-        // This will attempt to do the legacy keybindings loading too
-        _globals.LayerJson(json);
     }
 
     if (auto schemes{ json[SchemesKey.data()] })
@@ -519,7 +561,16 @@ void CascadiaSettings::_LayerOrCreateProfile(const Json::Value& profileJson)
         // `source`. Dynamic profiles _must_ be layered on an existing profile.
         if (!Profile::IsDynamicProfileObject(profileJson))
         {
-            auto profile = Profile::FromJson(profileJson);
+            Profile profile{};
+
+            // GH#2325: If we have a set of default profile settings, apply them here.
+            // We _won't_ have these settings yet for defaults, dynamic profiles.
+            if (_userDefaultProfileSettings)
+            {
+                profile.LayerJson(_userDefaultProfileSettings);
+            }
+
+            profile.LayerJson(profileJson);
             _profiles.emplace_back(profile);
         }
     }
@@ -553,6 +604,46 @@ Profile* CascadiaSettings::_FindMatchingProfile(const Json::Value& profileJson)
 }
 
 // Method Description:
+// - Finds the "default profile settings" if they exist in the users settings,
+//   and applies them to the existing profiles. The "default profile settings"
+//   are settings that should be applied to every profile a user has, with the
+//   option of being overridden by explicit values in the profile. This should
+//   be called _after_ the defaults have been parsed and dynamic profiles have
+//   been generated, but before the other user profiles have been loaded.
+// Arguments:
+// - <none>
+// Return Value:
+// - <none>
+void CascadiaSettings::_ApplyDefaultsFromUserSettings()
+{
+    // If `profiles` was an object, then look for the `defaults` object
+    // underneath it for the default profile settings.
+    auto defaultSettings{ Json::Value::null };
+
+    if (const auto profiles{ _userSettings[JsonKey(ProfilesKey)] })
+    {
+        if (profiles.isObject())
+        {
+            defaultSettings = profiles[JsonKey(DefaultSettingsKey)];
+        }
+    }
+
+    if (defaultSettings)
+    {
+        _userDefaultProfileSettings = defaultSettings;
+
+        // Remove the `guid` member from the default settings. That'll
+        // hyper-explode, so just don't let them do that.
+        _userDefaultProfileSettings.removeMember({ "guid" });
+
+        for (auto& profile : _profiles)
+        {
+            profile.LayerJson(_userDefaultProfileSettings);
+        }
+    }
+}
+
+// Method Description:
 // - Given a partial json serialization of a ColorScheme object, either layers that
 //   json on a matching ColorScheme we already have, or creates a new ColorScheme
 //   object from those settings.
@@ -570,16 +661,15 @@ void CascadiaSettings::_LayerOrCreateColorScheme(const Json::Value& schemeJson)
     }
     else
     {
-        auto scheme = ColorScheme::FromJson(schemeJson);
-        _globals.GetColorSchemes().emplace_back(scheme);
+        _globals.AddColorScheme(ColorScheme::FromJson(schemeJson));
     }
 }
 
 // Method Description:
 // - Finds a color scheme from our list of color schemes that matches the given
-//   json object. Uses ColorScheme::ShouldBeLayered to determine if the
-//   Json::Value is a match or not. This method should be used to find a color
-//   scheme to layer the given settings upon.
+//   json object. Uses ColorScheme::GetNameFromJson to find the name and then
+//   performs a lookup in the global map. This method should be used to find a
+//   color scheme to layer the given settings upon.
 // - Returns nullptr if no such match exists.
 // Arguments:
 // - json: an object which should be a partial serialization of a ColorScheme object.
@@ -588,15 +678,17 @@ void CascadiaSettings::_LayerOrCreateColorScheme(const Json::Value& schemeJson)
 //   color scheme exists.
 ColorScheme* CascadiaSettings::_FindMatchingColorScheme(const Json::Value& schemeJson)
 {
-    for (auto& scheme : _globals.GetColorSchemes())
+    if (auto schemeName = ColorScheme::GetNameFromJson(schemeJson))
     {
-        if (scheme.ShouldBeLayered(schemeJson))
+        auto& schemes = _globals.GetColorSchemes();
+        auto iterator = schemes.find(*schemeName);
+        if (iterator != schemes.end())
         {
             // HERE BE DRAGONS: Returning a pointer to a type in the vector is
             // maybe not the _safest_ thing, but we have a mind to make Profile
             // and ColorScheme winrt types in the future, so this will be safer
             // then.
-            return &scheme;
+            return &iterator->second;
         }
     }
     return nullptr;
@@ -690,7 +782,7 @@ std::optional<std::string> CascadiaSettings::_ReadUserSettings()
             // that two instances of the app will try and move the settings file
             // simultaneously. We don't know what might happen in that scenario,
             // but we're also not sure how to safely lock the file to prevent
-            // that from ocurring.
+            // that from occurring.
             THROW_LAST_ERROR_IF(!MoveFile(pathToRoamingSettingsFile.c_str(),
                                           pathToSettingsFile.c_str()));
 
@@ -811,7 +903,10 @@ std::wstring CascadiaSettings::GetDefaultSettingsPath()
 // - the Json::Value representing the profiles property from the given object
 const Json::Value& CascadiaSettings::_GetProfilesJsonObject(const Json::Value& json)
 {
-    return json[JsonKey(ProfilesKey)];
+    const auto& profilesProperty = json[JsonKey(ProfilesKey)];
+    return profilesProperty.isArray() ?
+               profilesProperty :
+               profilesProperty[JsonKey(ProfilesListKey)];
 }
 
 // Function Description:

@@ -248,10 +248,10 @@ bool WddmConEngine::IsInitialized()
             NewChar = &_displayState[rowIndex]->New[colIndex];
 
             OldChar->Character = NewChar->Character;
-            OldChar->Atribute = NewChar->Atribute;
+            OldChar->Attribute = NewChar->Attribute;
 
             NewChar->Character = L' ';
-            NewChar->Atribute = 0x0;
+            NewChar->Attribute = 0x0;
         }
     }
 
@@ -275,10 +275,10 @@ bool WddmConEngine::IsInitialized()
             NewChar = &_displayState[coord.Y]->New[coord.X + i];
 
             OldChar->Character = NewChar->Character;
-            OldChar->Atribute = NewChar->Atribute;
+            OldChar->Attribute = NewChar->Attribute;
 
             NewChar->Character = clusters.at(i).GetTextAsSingle();
-            NewChar->Atribute = _currentLegacyColorAttribute;
+            NewChar->Attribute = _currentLegacyColorAttribute;
         }
 
         return WDDMConUpdateDisplay(_hWddmConCtx, _displayState[coord.Y], FALSE);
@@ -307,7 +307,7 @@ bool WddmConEngine::IsInitialized()
 [[nodiscard]] HRESULT WddmConEngine::UpdateDrawingBrushes(COLORREF const /*colorForeground*/,
                                                           COLORREF const /*colorBackground*/,
                                                           const WORD legacyColorAttribute,
-                                                          const bool /*isBold*/,
+                                                          const ExtendedAttributes /*extendedAttrs*/,
                                                           bool const /*isSettingDefaultBrushes*/) noexcept
 {
     _currentLegacyColorAttribute = legacyColorAttribute;

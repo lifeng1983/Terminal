@@ -18,12 +18,10 @@ To compile Windows Terminal yourself using the source code, follow the instructi
 
 ## Starting Windows Terminal
 
-From the Windows Start menu, select Windows Terminal and run the application.
+1. Locate the _Windows Terminal_ app in your Start menu.
+2. Click _Windows Terminal_ to launch the app. If you need administrative privileges, right-click the entry and click `Run as administrator`. Alternatively, you can highlight the app and press `Ctrl`+`Shift`+`Enter`.
 
-Note: You can right click on the application item and run with Windows Administrator privilege if required.
-
-The default shell is PowerShell.
-
+NOTE: The default shell is PowerShell; you can change this using the _Running a Different Shell_ procedure.
 
 ### Command line options
 
@@ -32,7 +30,7 @@ None at this time. See issue [#607](https://github.com/microsoft/terminal/issues
 ## Multiple Tabs
 
 Additional shells can be started by hitting the `+` button from the tab bar -- a new instance of the
-default shell is displayed (default shortcut `Ctrl+Shift+1`).
+default shell is displayed (default shortcut: <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>1</kbd>).
 
 ## Running a Different Shell
 
@@ -72,20 +70,20 @@ All Windows Terminal settings are currently managed using the `profiles.json` fi
 To open the settings file from Windows Terminal:
 
 1. Click the `⌵` button in the top bar.
-2. From the dropdown list, click `Settings`. You can also use a shortcut: `Ctrl+,`.
+2. From the dropdown list, click `Settings`. You can also use a shortcut: <kbd>Ctrl</kbd>+<kbd>,</kbd>.
 3. Your default `json` editor will open the settings file.
 
 For an introduction to the various settings, see [Using Json Settings](UsingJsonSettings.md). The list of valid settings can be found in the [profiles.json documentation](../cascadia/SettingsSchema.md) section.
 
-## Tips and Tricks:
+## Tips and Tricks
 
 1. In PowerShell you can discover if the Windows Terminal is being used by checking for the existence of the environment variable `WT_SESSION`.
 
     Under pwsh you can also use
-`(Get-Process -Id $pid).Parent.Parent.ProcessName -eq 'WindowsTerminal'`
+`(Get-Process -Id $pid).Parent.ProcessName -eq 'WindowsTerminal'`
 
-    (ref https://twitter.com/r_keith_hill/status/1142871145852440576)
+    (ref [https://twitter.com/r_keith_hill/status/1142871145852440576](https://twitter.com/r_keith_hill/status/1142871145852440576))
 
-2. Terminal zoom can be changed by holding `Ctrl` and scrolling with mouse.
-3. If `useAcrylic` is enabled in profiles.json, background opacity can be changed by holding `Ctrl+Shift` and scrolling with mouse.
+2. Terminal zoom can be changed by holding <kbd>Ctrl</kbd> and scrolling with mouse.
+3. If `useAcrylic` is enabled in profiles.json, background opacity can be changed by holding <kbd>Ctrl</kbd>+<kbd>Shift</kbd> and scrolling with mouse. Note that acrylic transparency is limited by the OS only to focused windows.
 4. Please add more Tips and Tricks

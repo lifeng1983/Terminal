@@ -22,21 +22,22 @@ using namespace Microsoft::Console::VirtualTerminal;
 static std::wstring _KeyEventsToText(std::deque<std::unique_ptr<IInputEvent>>& inEventsToWrite)
 {
     std::wstring wstr = L"";
-    for (auto& ev : inEventsToWrite)
+    for (const auto& ev : inEventsToWrite)
     {
         if (ev->EventType() == InputEventType::KeyEvent)
         {
-            auto& k = static_cast<KeyEvent&>(*ev);
-            auto wch = k.GetCharData();
+            const auto& k = static_cast<KeyEvent&>(*ev);
+            const auto wch = k.GetCharData();
             wstr += wch;
         }
     }
     return wstr;
 }
 
+#pragma warning(suppress : 26455) // default constructor is throwing, too much effort to rearrange at this time.
 Terminal::Terminal() :
     _mutableViewport{ Viewport::Empty() },
-    _title{ L"" },
+    _title{},
     _colorTable{},
     _defaultFg{ RGB(255, 255, 255) },
     _defaultBg{ ARGB(0, 0, 0, 0) },
@@ -50,7 +51,10 @@ Terminal::Terminal() :
     _selectionAnchor{ 0, 0 },
     _endSelectionPosition{ 0, 0 }
 {
-    _stateMachine = std::make_unique<StateMachine>(new OutputStateMachineEngine(new TerminalDispatch(*this)));
+    auto dispatch = std::make_unique<TerminalDispatch>(*this);
+    auto engine = std::make_unique<OutputStateMachineEngine>(std::move(dispatch));
+
+    _stateMachine = std::make_unique<StateMachine>(std::move(engine));
 
     auto passAlongInput = [&](std::deque<std::unique_ptr<IInputEvent>>& inEventsToWrite) {
         if (!_pfnWriteInput)
@@ -87,10 +91,16 @@ void Terminal::CreateFromSettings(winrt::Microsoft::Terminal::Settings::ICoreSet
 {
     const COORD viewportSize{ Utils::ClampToShortMax(settings.InitialCols(), 1),
                               Utils::ClampToShortMax(settings.InitialRows(), 1) };
+
     // TODO:MSFT:20642297 - Support infinite scrollback here, if HistorySize is -1
     Create(viewportSize, Utils::ClampToShortMax(settings.HistorySize(), 0), renderTarget);
 
     UpdateSettings(settings);
+
+    if (_suppressApplicationTitle)
+    {
+        _title = _startingTitle;
+    }
 }
 
 // Method Description:
@@ -130,7 +140,7 @@ void Terminal::UpdateSettings(winrt::Microsoft::Terminal::Settings::ICoreSetting
 
     for (int i = 0; i < 16; i++)
     {
-        _colorTable[i] = settings.GetColorTableEntry(i);
+        _colorTable.at(i) = settings.GetColorTableEntry(i);
     }
 
     _snapOnInput = settings.SnapOnInput();
@@ -138,6 +148,10 @@ void Terminal::UpdateSettings(winrt::Microsoft::Terminal::Settings::ICoreSetting
     _wordDelimiters = settings.WordDelimiters();
 
     _copyOnSelect = settings.CopyOnSelect();
+
+    _suppressApplicationTitle = settings.SuppressApplicationTitle();
+
+    _startingTitle = settings.StartingTitle();
 
     // TODO:MSFT:21327402 - if HistorySize has changed, resize the buffer so we
     // have a smaller scrollback. We should do this carefully - if the new buffer
@@ -189,7 +203,25 @@ void Terminal::Write(std::wstring_view stringView)
 {
     auto lock = LockForWriting();
 
-    _stateMachine->ProcessString(stringView.data(), stringView.size());
+    _stateMachine->ProcessString(stringView);
+}
+
+// Method Description:
+// - Attempts to snap to the bottom of the buffer, if SnapOnInput is true. Does
+//   nothing if SnapOnInput is set to false, or we're already at the bottom of
+//   the buffer.
+// Arguments:
+// - <none>
+// Return Value:
+// - <none>
+void Terminal::TrySnapOnInput()
+{
+    if (_snapOnInput && _scrollOffset != 0)
+    {
+        auto lock = LockForWriting();
+        _scrollOffset = 0;
+        _NotifyScrollEvent();
+    }
 }
 
 // Method Description:
@@ -207,18 +239,13 @@ void Terminal::Write(std::wstring_view stringView)
 // - false if we did not translate the key, and it should be processed into a character.
 bool Terminal::SendKeyEvent(const WORD vkey, const WORD scanCode, const ControlKeyStates states)
 {
-    if (_snapOnInput && _scrollOffset != 0)
-    {
-        auto lock = LockForWriting();
-        _scrollOffset = 0;
-        _NotifyScrollEvent();
-    }
+    TrySnapOnInput();
 
     // Alt key sequences _require_ the char to be in the keyevent. If alt is
     // pressed, manually get the character that's being typed, and put it in the
     // KeyEvent.
     // DON'T manually handle Alt+Space - the system will use this to bring up
-    // the system menu for restore, min/maximimize, size, move, close
+    // the system menu for restore, min/maximize, size, move, close
     wchar_t ch = UNICODE_NULL;
     if (states.IsAltPressed() && vkey != VK_SPACE)
     {
@@ -259,6 +286,11 @@ bool Terminal::SendKeyEvent(const WORD vkey, const WORD scanCode, const ControlK
     return translated && manuallyHandled;
 }
 
+bool Terminal::SendCharEvent(const wchar_t ch)
+{
+    return _terminalInput->HandleChar(ch);
+}
+
 // Method Description:
 // - Returns the keyboard's scan code for the given virtual key code.
 // Arguments:
@@ -279,30 +311,41 @@ WORD Terminal::_ScanCodeFromVirtualKey(const WORD vkey) noexcept
 // Return Value:
 // - The character that would result from this virtual key code and keyboard state.
 wchar_t Terminal::_CharacterFromKeyEvent(const WORD vkey, const WORD scanCode, const ControlKeyStates states) noexcept
+try
 {
     const auto sc = scanCode != 0 ? scanCode : _ScanCodeFromVirtualKey(vkey);
 
     // We might want to use GetKeyboardState() instead of building our own keyState.
     // The question is whether that's necessary though. For now it seems to work fine as it is.
-    BYTE keyState[256] = {};
-    keyState[VK_SHIFT] = states.IsShiftPressed() ? 0x80 : 0;
-    keyState[VK_CONTROL] = states.IsCtrlPressed() ? 0x80 : 0;
-    keyState[VK_MENU] = states.IsAltPressed() ? 0x80 : 0;
+    std::array<BYTE, 256> keyState = {};
+    keyState.at(VK_SHIFT) = states.IsShiftPressed() ? 0x80 : 0;
+    keyState.at(VK_CONTROL) = states.IsCtrlPressed() ? 0x80 : 0;
+    keyState.at(VK_MENU) = states.IsAltPressed() ? 0x80 : 0;
+
+    // For the following use of ToUnicodeEx() please look here:
+    //   https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-tounicodeex
 
     // Technically ToUnicodeEx() can produce arbitrarily long sequences of diacritics etc.
     // Since we only handle the case of a single UTF-16 code point, we can set the buffer size to 2 though.
-    constexpr size_t bufferSize = 2;
-    wchar_t buffer[bufferSize];
+    std::array<wchar_t, 2> buffer;
 
-    // wFlags: If bit 2 is set, keyboard state is not changed (Windows 10, version 1607 and newer)
-    const auto result = ToUnicodeEx(vkey, sc, keyState, buffer, bufferSize, 0b100, nullptr);
+    // wFlags:
+    // * If bit 0 is set, a menu is active.
+    //   If this flag is not specified ToUnicodeEx will send us character events on certain Alt+Key combinations (e.g. Alt+Arrow-Up).
+    // * If bit 2 is set, keyboard state is not changed (Windows 10, version 1607 and newer)
+    const auto result = ToUnicodeEx(vkey, sc, keyState.data(), buffer.data(), gsl::narrow_cast<int>(buffer.size()), 0b101, nullptr);
 
     // TODO:GH#2853 We're only handling single UTF-16 code points right now, since that's the only thing KeyEvent supports.
-    return result == 1 || result == -1 ? buffer[0] : 0;
+    return result == 1 || result == -1 ? buffer.at(0) : 0;
+}
+catch (...)
+{
+    LOG_CAUGHT_EXCEPTION();
+    return UNICODE_INVALID;
 }
 
 // Method Description:
-// - Aquire a read lock on the terminal.
+// - Acquire a read lock on the terminal.
 // Return Value:
 // - a shared_lock which can be used to unlock the terminal. The shared_lock
 //      will release this lock when it's destructed.
@@ -312,7 +355,7 @@ wchar_t Terminal::_CharacterFromKeyEvent(const WORD vkey, const WORD scanCode, c
 }
 
 // Method Description:
-// - Aquire a write lock on the terminal.
+// - Acquire a write lock on the terminal.
 // Return Value:
 // - a unique_lock which can be used to unlock the terminal. The unique_lock
 //      will release this lock when it's destructed.
@@ -331,16 +374,26 @@ short Terminal::GetBufferHeight() const noexcept
     return _mutableViewport.BottomExclusive();
 }
 
-// _ViewStartIndex is also the length of the scrollback
-int Terminal::_ViewStartIndex() const noexcept
+// ViewStartIndex is also the length of the scrollback
+int Terminal::ViewStartIndex() const noexcept
 {
     return _mutableViewport.Top();
+}
+
+int Terminal::ViewEndIndex() const noexcept
+{
+    return _mutableViewport.BottomInclusive();
 }
 
 // _VisibleStartIndex is the first visible line of the buffer
 int Terminal::_VisibleStartIndex() const noexcept
 {
-    return std::max(0, _ViewStartIndex() - _scrollOffset);
+    return std::max(0, ViewStartIndex() - _scrollOffset);
+}
+
+int Terminal::_VisibleEndIndex() const noexcept
+{
+    return std::max(0, ViewEndIndex() - _scrollOffset);
 }
 
 Viewport Terminal::_GetVisibleViewport() const noexcept
@@ -361,114 +414,101 @@ Viewport Terminal::_GetVisibleViewport() const noexcept
 void Terminal::_WriteBuffer(const std::wstring_view& stringView)
 {
     auto& cursor = _buffer->GetCursor();
-    const Viewport bufferSize = _buffer->GetSize();
+
+    // Defer the cursor drawing while we are iterating the string, for a better performance.
+    // We can not waste time displaying a cursor event when we know more text is coming right behind it.
+    cursor.StartDeferDrawing();
 
     for (size_t i = 0; i < stringView.size(); i++)
     {
-        wchar_t wch = stringView[i];
+        const auto wch = stringView.at(i);
         const COORD cursorPosBefore = cursor.GetPosition();
         COORD proposedCursorPosition = cursorPosBefore;
-        bool notifyScroll = false;
 
-        if (wch == UNICODE_LINEFEED)
+        // TODO: MSFT 21006766
+        // This is not great but I need it demoable. Fix by making a buffer stream writer.
+        //
+        // If wch is a surrogate character we need to read 2 code units
+        // from the stringView to form a single code point.
+        const auto isSurrogate = wch >= 0xD800 && wch <= 0xDFFF;
+        const auto view = stringView.substr(i, isSurrogate ? 2 : 1);
+        const OutputCellIterator it{ view, _buffer->GetCurrentAttributes() };
+        const auto end = _buffer->Write(it);
+        const auto cellDistance = end.GetCellDistance(it);
+        const auto inputDistance = end.GetInputDistance(it);
+
+        if (inputDistance > 0)
         {
-            proposedCursorPosition.Y++;
-        }
-        else if (wch == UNICODE_CARRIAGERETURN)
-        {
-            proposedCursorPosition.X = 0;
-        }
-        else if (wch == UNICODE_BACKSPACE)
-        {
-            if (cursorPosBefore.X == 0)
-            {
-                proposedCursorPosition.X = bufferSize.Width() - 1;
-                proposedCursorPosition.Y--;
-            }
-            else
-            {
-                proposedCursorPosition.X--;
-            }
-        }
-        else if (wch == UNICODE_BEL)
-        {
-            // TODO: GitHub #1883
-            // For now its empty just so we don't try to write the BEL character
+            // If "wch" was a surrogate character, we just consumed 2 code units above.
+            // -> Increment "i" by 1 in that case and thus by 2 in total in this iteration.
+            proposedCursorPosition.X += gsl::narrow<SHORT>(cellDistance);
+            i += inputDistance - 1;
         }
         else
         {
-            // TODO: MSFT 21006766
-            // This is not great but I need it demoable. Fix by making a buffer stream writer.
-            if (wch >= 0xD800 && wch <= 0xDFFF)
-            {
-                OutputCellIterator it{ stringView.substr(i, 2), _buffer->GetCurrentAttributes() };
-                const auto end = _buffer->Write(it);
-                const auto cellDistance = end.GetCellDistance(it);
-                i += cellDistance - 1;
-                proposedCursorPosition.X += gsl::narrow<SHORT>(cellDistance);
-            }
-            else
-            {
-                OutputCellIterator it{ stringView.substr(i, 1), _buffer->GetCurrentAttributes() };
-                const auto end = _buffer->Write(it);
-                const auto cellDistance = end.GetCellDistance(it);
-                proposedCursorPosition.X += gsl::narrow<SHORT>(cellDistance);
-            }
-        }
-
-        // If we're about to try to place the cursor past the right edge of the buffer, move it down a row
-        // This is another patch that GH#780 should supersede. This is really correcting for other bad situations
-        // like bisecting (writing only the leading half because there's no room for the trailing) a wide character
-        // into the buffer. However, it's not really all-up correctable without implementing a full WriteStream here.
-        // Also, this particular code RIGHT HERE shouldn't need to know anything about the cursor or the cells advanced
-        // which also will be solved by GH#780 (hopefully).
-        if (proposedCursorPosition.X > bufferSize.RightInclusive())
-        {
+            // If _WriteBuffer() is called with a consecutive string longer than the viewport/buffer width
+            // the call to _buffer->Write() will refuse to write anything on the current line.
+            // GetInputDistance() thus returns 0, which would in turn cause i to be
+            // decremented by 1 below and force the outer loop to loop forever.
+            // This if() basically behaves as if "\r\n" had been encountered above and retries the write.
+            // With well behaving shells during normal operation this safeguard should normally not be encountered.
             proposedCursorPosition.X = 0;
             proposedCursorPosition.Y++;
         }
 
-        // If we're about to scroll past the bottom of the buffer, instead cycle the buffer.
-        const auto newRows = proposedCursorPosition.Y - bufferSize.Height() + 1;
-        if (newRows > 0)
+        _AdjustCursorPosition(proposedCursorPosition);
+    }
+
+    cursor.EndDeferDrawing();
+}
+
+void Terminal::_AdjustCursorPosition(const COORD proposedPosition)
+{
+#pragma warning(suppress : 26496) // cpp core checks wants this const but it's modified below.
+    auto proposedCursorPosition = proposedPosition;
+    auto& cursor = _buffer->GetCursor();
+    const Viewport bufferSize = _buffer->GetSize();
+    bool notifyScroll = false;
+
+    // If we're about to scroll past the bottom of the buffer, instead cycle the buffer.
+    const auto newRows = proposedCursorPosition.Y - bufferSize.Height() + 1;
+    if (newRows > 0)
+    {
+        for (auto dy = 0; dy < newRows; dy++)
         {
-            for (auto dy = 0; dy < newRows; dy++)
-            {
-                _buffer->IncrementCircularBuffer();
-                proposedCursorPosition.Y--;
-            }
+            _buffer->IncrementCircularBuffer();
+            proposedCursorPosition.Y--;
+        }
+        notifyScroll = true;
+    }
+
+    // Update Cursor Position
+    cursor.SetPosition(proposedCursorPosition);
+
+    const COORD cursorPosAfter = cursor.GetPosition();
+
+    // Move the viewport down if the cursor moved below the viewport.
+    if (cursorPosAfter.Y > _mutableViewport.BottomInclusive())
+    {
+        const auto newViewTop = std::max(0, cursorPosAfter.Y - (_mutableViewport.Height() - 1));
+        if (newViewTop != _mutableViewport.Top())
+        {
+            _mutableViewport = Viewport::FromDimensions({ 0, gsl::narrow<short>(newViewTop) }, _mutableViewport.Dimensions());
             notifyScroll = true;
         }
+    }
 
-        // This section is essentially equivalent to `AdjustCursorPosition`
-        // Update Cursor Position
-        cursor.SetPosition(proposedCursorPosition);
-
-        const COORD cursorPosAfter = cursor.GetPosition();
-
-        // Move the viewport down if the cursor moved below the viewport.
-        if (cursorPosAfter.Y > _mutableViewport.BottomInclusive())
-        {
-            const auto newViewTop = std::max(0, cursorPosAfter.Y - (_mutableViewport.Height() - 1));
-            if (newViewTop != _mutableViewport.Top())
-            {
-                _mutableViewport = Viewport::FromDimensions({ 0, gsl::narrow<short>(newViewTop) }, _mutableViewport.Dimensions());
-                notifyScroll = true;
-            }
-        }
-
-        if (notifyScroll)
-        {
-            _buffer->GetRenderTarget().TriggerRedrawAll();
-            _NotifyScrollEvent();
-        }
+    if (notifyScroll)
+    {
+        _buffer->GetRenderTarget().TriggerRedrawAll();
+        _NotifyScrollEvent();
     }
 }
 
 void Terminal::UserScrollViewport(const int viewTop)
 {
     const auto clampedNewTop = std::max(0, viewTop);
-    const auto realTop = _ViewStartIndex();
+    const auto realTop = ViewStartIndex();
     const auto newDelta = realTop - clampedNewTop;
     // if viewTop > realTop, we want the offset to be 0.
 
@@ -476,12 +516,13 @@ void Terminal::UserScrollViewport(const int viewTop)
     _buffer->GetRenderTarget().TriggerRedrawAll();
 }
 
-int Terminal::GetScrollOffset()
+int Terminal::GetScrollOffset() noexcept
 {
     return _VisibleStartIndex();
 }
 
-void Terminal::_NotifyScrollEvent()
+void Terminal::_NotifyScrollEvent() noexcept
+try
 {
     if (_pfnScrollPositionChanged)
     {
@@ -492,20 +533,21 @@ void Terminal::_NotifyScrollEvent()
         _pfnScrollPositionChanged(top, height, bottom);
     }
 }
+CATCH_LOG()
 
 void Terminal::SetWriteInputCallback(std::function<void(std::wstring&)> pfn) noexcept
 {
-    _pfnWriteInput = pfn;
+    _pfnWriteInput.swap(pfn);
 }
 
 void Terminal::SetTitleChangedCallback(std::function<void(const std::wstring_view&)> pfn) noexcept
 {
-    _pfnTitleChanged = pfn;
+    _pfnTitleChanged.swap(pfn);
 }
 
 void Terminal::SetScrollPositionChangedCallback(std::function<void(const int, const int, const int)> pfn) noexcept
 {
-    _pfnScrollPositionChanged = pfn;
+    _pfnScrollPositionChanged.swap(pfn);
 }
 
 // Method Description:
@@ -514,12 +556,13 @@ void Terminal::SetScrollPositionChangedCallback(std::function<void(const int, co
 // - pfn: a function callback that takes a uint32 (DWORD COLORREF) color in the format 0x00BBGGRR
 void Terminal::SetBackgroundCallback(std::function<void(const uint32_t)> pfn) noexcept
 {
-    _pfnBackgroundColorChanged = pfn;
+    _pfnBackgroundColorChanged.swap(pfn);
 }
 
 void Terminal::_InitializeColorTable()
+try
 {
-    gsl::span<COLORREF> tableView = { &_colorTable[0], gsl::narrow<ptrdiff_t>(_colorTable.size()) };
+    const gsl::span<COLORREF> tableView = { _colorTable.data(), gsl::narrow<ptrdiff_t>(_colorTable.size()) };
     // First set up the basic 256 colors
     Utils::Initialize256ColorTable(tableView);
     // Then use fill the first 16 values with the Campbell scheme
@@ -527,6 +570,7 @@ void Terminal::_InitializeColorTable()
     // Then make sure all the values have an alpha of 255
     Utils::SetColorTableAlpha(tableView, 0xff);
 }
+CATCH_LOG()
 
 // Method Description:
 // - Sets the visibility of the text cursor.

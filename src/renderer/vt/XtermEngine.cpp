@@ -10,13 +10,12 @@ using namespace Microsoft::Console::Render;
 using namespace Microsoft::Console::Types;
 
 XtermEngine::XtermEngine(_In_ wil::unique_hfile hPipe,
-                         wil::shared_event shutdownEvent,
                          const IDefaultColorProvider& colorProvider,
                          const Viewport initialViewport,
                          _In_reads_(cColorTable) const COLORREF* const ColorTable,
                          const WORD cColorTable,
                          const bool fUseAsciiOnly) :
-    VtEngine(std::move(hPipe), shutdownEvent, colorProvider, initialViewport),
+    VtEngine(std::move(hPipe), colorProvider, initialViewport),
     _ColorTable(ColorTable),
     _cColorTable(cColorTable),
     _fUseAsciiOnly(fUseAsciiOnly),
@@ -172,6 +171,7 @@ XtermEngine::XtermEngine(_In_ wil::unique_hfile hPipe,
 // - colorBackground: The RGB Color to use to paint the background of the text.
 // - legacyColorAttribute: A console attributes bit field specifying the brush
 //      colors we should use.
+// - extendedAttrs - extended text attributes (italic, underline, etc.) to use.
 // - isSettingDefaultBrushes: indicates if we should change the background color of
 //      the window. Unused for VT
 // Return Value:
@@ -179,7 +179,7 @@ XtermEngine::XtermEngine(_In_ wil::unique_hfile hPipe,
 [[nodiscard]] HRESULT XtermEngine::UpdateDrawingBrushes(const COLORREF colorForeground,
                                                         const COLORREF colorBackground,
                                                         const WORD legacyColorAttribute,
-                                                        const bool isBold,
+                                                        const ExtendedAttributes extendedAttrs,
                                                         const bool /*isSettingDefaultBrushes*/) noexcept
 {
     //When we update the brushes, check the wAttrs to see if the LVB_UNDERSCORE
@@ -188,10 +188,14 @@ XtermEngine::XtermEngine(_In_ wil::unique_hfile hPipe,
     // We have to do this here, instead of in PaintBufferGridLines, because
     //      we'll have already painted the text by the time PaintBufferGridLines
     //      is called.
-
+    // TODO:GH#2915 Treat underline separately from LVB_UNDERSCORE
     RETURN_IF_FAILED(_UpdateUnderline(legacyColorAttribute));
     // The base xterm mode only knows about 16 colors
-    return VtEngine::_16ColorUpdateDrawingBrushes(colorForeground, colorBackground, isBold, _ColorTable, _cColorTable);
+    return VtEngine::_16ColorUpdateDrawingBrushes(colorForeground,
+                                                  colorBackground,
+                                                  WI_IsFlagSet(extendedAttrs, ExtendedAttributes::Bold),
+                                                  _ColorTable,
+                                                  _cColorTable);
 }
 
 // Routine Description:
@@ -254,6 +258,20 @@ XtermEngine::XtermEngine(_In_ wil::unique_hfile hPipe,
                 hr = _Write(seq);
             }
         }
+        else if (_delayedEolWrap)
+        {
+            // GH#1245, GH#357 - If we were in the delayed EOL wrap state, make
+            // sure to _manually_ position the cursor now, with a full CUP
+            // sequence, don't try and be clever with \b or \r or other control
+            // sequences. Different terminals (conhost, gnome-terminal, wt) all
+            // behave differently with how the cursor behaves at an end of line.
+            // This is the only solution that works in all of them, and also
+            // works wrapped lines emitted by conpty.
+            //
+            // Make sure to do this _after_ the possible \r\n branch above,
+            // otherwise we might accidentally break wrapped lines (GH#405)
+            hr = _CursorPosition(coord);
+        }
         else if (coord.X == 0 && coord.Y == _lastText.Y)
         {
             // Start of this line
@@ -294,6 +312,7 @@ XtermEngine::XtermEngine(_In_ wil::unique_hfile hPipe,
         _newBottomLine = false;
     }
     _deferredCursorPos = INVALID_COORDS;
+    _delayedEolWrap = false;
     return hr;
 }
 
@@ -429,7 +448,7 @@ XtermEngine::XtermEngine(_In_ wil::unique_hfile hPipe,
 // - wstr - wstring of text to be written
 // Return Value:
 // - S_OK or suitable HRESULT error from either conversion or writing pipe.
-[[nodiscard]] HRESULT XtermEngine::WriteTerminalW(const std::wstring& wstr) noexcept
+[[nodiscard]] HRESULT XtermEngine::WriteTerminalW(const std::wstring_view wstr) noexcept
 {
     return _fUseAsciiOnly ?
                VtEngine::_WriteTerminalAscii(wstr) :

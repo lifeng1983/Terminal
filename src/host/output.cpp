@@ -26,7 +26,7 @@ using namespace Microsoft::Console::Interactivity;
     CONSOLE_INFORMATION& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
 
     FontInfo fiFont(gci.GetFaceName(),
-                    static_cast<BYTE>(gci.GetFontFamily()),
+                    gsl::narrow_cast<unsigned char>(gci.GetFontFamily()),
                     gci.GetFontWeight(),
                     gci.GetFontSize(),
                     gci.GetCodePage());
@@ -296,7 +296,8 @@ static void _ScrollScreen(SCREEN_INFORMATION& screenInfo, const Viewport& source
 bool StreamScrollRegion(SCREEN_INFORMATION& screenInfo)
 {
     // Rotate the circular buffer around and wipe out the previous final line.
-    bool fSuccess = screenInfo.GetTextBuffer().IncrementCircularBuffer();
+    const bool inVtMode = WI_IsFlagSet(screenInfo.OutputMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    bool fSuccess = screenInfo.GetTextBuffer().IncrementCircularBuffer(inVtMode);
     if (fSuccess)
     {
         // Trigger a graphical update if we're active.
@@ -456,8 +457,20 @@ void SetActiveScreenBuffer(SCREEN_INFORMATION& screenInfo)
     CONSOLE_INFORMATION& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
     gci.pCurrentScreenBuffer = &screenInfo;
 
-    // initialize cursor
-    screenInfo.GetTextBuffer().GetCursor().SetIsOn(false);
+    // initialize cursor GH#4102 - Typically, the cursor is set to on by the
+    // cursor blinker. Unfortunately, in conpty mode, there is no cursor
+    // blinker. So, in conpty mode, we need to leave the cursor on always. The
+    // cursor can still be set to hidden, and whether the cursor should be
+    // blinking will still be passed through to the terminal, but internally,
+    // the cursor should always be on.
+    //
+    // In particular, some applications make use of a calling
+    // `SetConsoleScreenBuffer` and `SetCursorPosition` without printing any
+    // text in between these calls. If we initialize the cursor to Off in conpty
+    // mode, then the cursor will remain off until they print text. This can
+    // lead to alignment problems in the terminal, because we won't move the
+    // terminal's cursor in this _exact_ scenario.
+    screenInfo.GetTextBuffer().GetCursor().SetIsOn(gci.IsInVtIoMode());
 
     // set font
     screenInfo.RefreshFontWithRenderer();
@@ -474,21 +487,10 @@ void SetActiveScreenBuffer(SCREEN_INFORMATION& screenInfo)
     WriteToScreen(screenInfo, screenInfo.GetViewport());
 }
 
-// Routine Description:
-// - Dispatches final close event to connected clients or will run down and exit (and never return) if all clients
-//   are already gone.
-// - NOTE: MUST BE CALLED UNDER LOCK. We don't want clients joining or leaving while we're telling them to close and running down.
-// Arguments:
-// - <none>
-// Return Value:
-// - <none>
 // TODO: MSFT 9450717 This should join the ProcessList class when CtrlEvents become moved into the server. https://osgvsowi/9450717
 void CloseConsoleProcessState()
 {
-    auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
-
-    FAIL_FAST_IF(!(gci.IsConsoleLocked()));
-
+    const CONSOLE_INFORMATION& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
     // If there are no connected processes, sending control events is pointless as there's no one do send them to. In
     // this case we'll just exit conhost.
 
@@ -500,4 +502,14 @@ void CloseConsoleProcessState()
     }
 
     HandleCtrlEvent(CTRL_CLOSE_EVENT);
+
+    // Jiggle the handle: (see MSFT:19419231)
+    // When we call this function, we'll only actually close the console once
+    //      we're totally unlocked. If our caller has the console locked, great,
+    //      we'll dispatch the ctrl event once they unlock. However, if they're
+    //      not running under lock (eg PtySignalInputThread::_GetData), then the
+    //      ctrl event will never actually get dispatched.
+    // So, lock and unlock here, to make sure the ctrl event gets handled.
+    LockConsole();
+    auto Unlock = wil::scope_exit([&] { UnlockConsole(); });
 }
