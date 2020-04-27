@@ -3,11 +3,13 @@
 
 #include "pch.h"
 #include <UIAutomationCore.h>
+#include <LibraryResources.h>
 #include "TermControlAutomationPeer.h"
 #include "TermControl.h"
 #include "TermControlAutomationPeer.g.cpp"
 
 #include "XamlUiaTextRange.h"
+#include "..\types\UiaTracing.h"
 
 using namespace Microsoft::Console::Types;
 using namespace winrt::Windows::UI::Xaml::Automation::Peers;
@@ -43,6 +45,7 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
     // - <none>
     void TermControlAutomationPeer::SignalSelectionChanged()
     {
+        UiaTracing::Signal::SelectionChanged();
         Dispatcher().RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal, [&]() {
             // The event that is raised when the text selection is modified.
             RaiseAutomationEvent(AutomationEvents::TextPatternOnTextSelectionChanged);
@@ -57,6 +60,7 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
     // - <none>
     void TermControlAutomationPeer::SignalTextChanged()
     {
+        UiaTracing::Signal::TextChanged();
         Dispatcher().RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal, [&]() {
             // The event that is raised when textual content is modified.
             RaiseAutomationEvent(AutomationEvents::TextPatternOnTextChanged);
@@ -71,13 +75,19 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
     // - <none>
     void TermControlAutomationPeer::SignalCursorChanged()
     {
+        UiaTracing::Signal::CursorChanged();
         Dispatcher().RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal, [&]() {
             // The event that is raised when the text was changed in an edit control.
-            RaiseAutomationEvent(AutomationEvents::TextEditTextChanged);
+            // Do NOT fire a TextEditTextChanged. Generally, an app on the other side
+            //    will expect more information. Though you can dispatch that event
+            //    on its own, it may result in a nullptr exception on the other side
+            //    because no additional information was provided. Crashing the screen
+            //    reader.
+            RaiseAutomationEvent(AutomationEvents::TextPatternOnTextSelectionChanged);
         });
     }
 
-    winrt::hstring TermControlAutomationPeer::GetClassNameCore() const
+    hstring TermControlAutomationPeer::GetClassNameCore() const
     {
         return L"TermControl";
     }
@@ -87,13 +97,12 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
         return AutomationControlType::Text;
     }
 
-    winrt::hstring TermControlAutomationPeer::GetLocalizedControlTypeCore() const
+    hstring TermControlAutomationPeer::GetLocalizedControlTypeCore() const
     {
-        // TODO GitHub #2142: Localize string
-        return L"TerminalControl";
+        return RS_(L"TerminalControl_ControlType");
     }
 
-    winrt::Windows::Foundation::IInspectable TermControlAutomationPeer::GetPatternCore(PatternInterface patternInterface) const
+    Windows::Foundation::IInspectable TermControlAutomationPeer::GetPatternCore(PatternInterface patternInterface) const
     {
         switch (patternInterface)
         {
@@ -105,15 +114,41 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
         }
     }
 
+    AutomationOrientation TermControlAutomationPeer::GetOrientationCore() const
+    {
+        return AutomationOrientation::Vertical;
+    }
+
+    hstring TermControlAutomationPeer::GetNameCore() const
+    {
+        // fallback to title if profile name is empty
+        auto profileName = _termControl->GetProfileName();
+        if (profileName.empty())
+        {
+            return _termControl->Title();
+        }
+        return profileName;
+    }
+
+    hstring TermControlAutomationPeer::GetHelpTextCore() const
+    {
+        return _termControl->Title();
+    }
+
+    AutomationLiveSetting TermControlAutomationPeer::GetLiveSettingCore() const
+    {
+        return AutomationLiveSetting::Polite;
+    }
+
 #pragma region ITextProvider
-    winrt::com_array<XamlAutomation::ITextRangeProvider> TermControlAutomationPeer::GetSelection()
+    com_array<XamlAutomation::ITextRangeProvider> TermControlAutomationPeer::GetSelection()
     {
         SAFEARRAY* pReturnVal;
         THROW_IF_FAILED(_uiaProvider->GetSelection(&pReturnVal));
         return WrapArrayOfTextRangeProviders(pReturnVal);
     }
 
-    winrt::com_array<XamlAutomation::ITextRangeProvider> TermControlAutomationPeer::GetVisibleRanges()
+    com_array<XamlAutomation::ITextRangeProvider> TermControlAutomationPeer::GetVisibleRanges()
     {
         SAFEARRAY* pReturnVal;
         THROW_IF_FAILED(_uiaProvider->GetVisibleRanges(&pReturnVal));
@@ -152,7 +187,7 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
         return xutr.as<XamlAutomation::ITextRangeProvider>();
     }
 
-    Windows::UI::Xaml::Automation::SupportedTextSelection TermControlAutomationPeer::SupportedTextSelection()
+    XamlAutomation::SupportedTextSelection TermControlAutomationPeer::SupportedTextSelection()
     {
         UIA::SupportedTextSelection returnVal;
         THROW_IF_FAILED(_uiaProvider->get_SupportedTextSelection(&returnVal));
@@ -171,10 +206,10 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
     {
         auto rect = GetBoundingRectangle();
         return {
-            gsl::narrow<LONG>(rect.X),
-            gsl::narrow<LONG>(rect.Y),
-            gsl::narrow<LONG>(rect.X + rect.Width),
-            gsl::narrow<LONG>(rect.Y + rect.Height)
+            gsl::narrow_cast<LONG>(rect.X),
+            gsl::narrow_cast<LONG>(rect.Y),
+            gsl::narrow_cast<LONG>(rect.X + rect.Width),
+            gsl::narrow_cast<LONG>(rect.Y + rect.Height)
         };
     }
 
@@ -214,7 +249,7 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
     // - SAFEARRAY of UIA::UiaTextRange (ITextRangeProviders)
     // Return Value:
     // - com_array of Xaml Wrapped UiaTextRange (ITextRangeProviders)
-    winrt::com_array<XamlAutomation::ITextRangeProvider> TermControlAutomationPeer::WrapArrayOfTextRangeProviders(SAFEARRAY* textRanges)
+    com_array<XamlAutomation::ITextRangeProvider> TermControlAutomationPeer::WrapArrayOfTextRangeProviders(SAFEARRAY* textRanges)
     {
         // transfer ownership of UiaTextRanges to this new vector
         auto providers = SafeArrayToOwningVector<::Microsoft::Terminal::TermControlUiaTextRange>(textRanges);
@@ -225,11 +260,11 @@ namespace winrt::Microsoft::Terminal::TerminalControl::implementation
         auto parentProvider = this->ProviderFromPeer(*this);
         for (int i = 0; i < count; i++)
         {
-            auto xutr = winrt::make_self<XamlUiaTextRange>(providers[i].detach(), parentProvider);
+            auto xutr = make_self<XamlUiaTextRange>(providers[i].detach(), parentProvider);
             vec.emplace_back(xutr.as<XamlAutomation::ITextRangeProvider>());
         }
 
-        winrt::com_array<XamlAutomation::ITextRangeProvider> result{ vec };
+        com_array<XamlAutomation::ITextRangeProvider> result{ vec };
 
         return result;
     }

@@ -26,7 +26,7 @@ namespace Microsoft.Terminal.Wpf
         private DispatcherTimer blinkTimer;
         private NativeMethods.ScrollCallback scrollCallback;
         private NativeMethods.WriteCallback writeCallback;
-        
+
         /// <summary>
         /// Initializes a new instance of the <see cref="TerminalContainer"/> class.
         /// </summary>
@@ -35,7 +35,7 @@ namespace Microsoft.Terminal.Wpf
             this.MessageHook += this.TerminalContainer_MessageHook;
             this.GotFocus += this.TerminalContainer_GotFocus;
             this.Focusable = true;
-            
+
             var blinkTime = NativeMethods.GetCaretBlinkTime();
 
             if (blinkTime != uint.MaxValue)
@@ -220,9 +220,11 @@ namespace Microsoft.Terminal.Wpf
                 switch ((NativeMethods.WindowMessage)msg)
                 {
                     case NativeMethods.WindowMessage.WM_SETFOCUS:
+                        NativeMethods.TerminalSetFocus(this.terminal);
                         this.blinkTimer?.Start();
                         break;
                     case NativeMethods.WindowMessage.WM_KILLFOCUS:
+                        NativeMethods.TerminalKillFocus(this.terminal);
                         this.blinkTimer?.Stop();
                         NativeMethods.TerminalSetCursorVisible(this.terminal, false);
                         break;
@@ -230,31 +232,15 @@ namespace Microsoft.Terminal.Wpf
                         this.Focus();
                         NativeMethods.SetFocus(this.hwnd);
                         break;
-                    case NativeMethods.WindowMessage.WM_LBUTTONDOWN:
-                        this.LeftClickHandler((int)lParam);
-                        break;
-                    case NativeMethods.WindowMessage.WM_RBUTTONDOWN:
-                        if (NativeMethods.TerminalIsSelectionActive(this.terminal))
-                        {
-                            Clipboard.SetText(NativeMethods.TerminalGetSelection(this.terminal));
-                        }
-                        else
-                        {
-                            this.connection.WriteInput(Clipboard.GetText());
-                        }
-
-                        break;
-                    case NativeMethods.WindowMessage.WM_MOUSEMOVE:
-                        this.MouseMoveHandler((int)wParam, (int)lParam);
-                        break;
                     case NativeMethods.WindowMessage.WM_KEYDOWN:
+                        // WM_KEYDOWN lParam layout documentation: https://docs.microsoft.com/en-us/windows/win32/inputdev/wm-keydown
                         NativeMethods.TerminalSetCursorVisible(this.terminal, true);
-                        NativeMethods.TerminalClearSelection(this.terminal);
-                        NativeMethods.TerminalSendKeyEvent(this.terminal, wParam);
+                        NativeMethods.TerminalSendKeyEvent(this.terminal, (ushort)wParam, (ushort)((uint)lParam >> 16));
                         this.blinkTimer?.Start();
                         break;
                     case NativeMethods.WindowMessage.WM_CHAR:
-                        NativeMethods.TerminalSendCharEvent(this.terminal, (char)wParam);
+                        // WM_CHAR lParam layout documentation: https://docs.microsoft.com/en-us/windows/win32/inputdev/wm-char
+                        NativeMethods.TerminalSendCharEvent(this.terminal, (char)wParam, (ushort)((uint)lParam >> 16));
                         break;
                     case NativeMethods.WindowMessage.WM_WINDOWPOSCHANGED:
                         var windowpos = (NativeMethods.WINDOWPOS)Marshal.PtrToStructure(lParam, typeof(NativeMethods.WINDOWPOS));
@@ -271,7 +257,7 @@ namespace Microsoft.Terminal.Wpf
 
                         break;
                     case NativeMethods.WindowMessage.WM_MOUSEWHEEL:
-                        var delta = ((int)wParam) >> 16;
+                        var delta = (short)(((long)wParam) >> 16);
                         this.UserScrolled?.Invoke(this, delta);
                         break;
                 }

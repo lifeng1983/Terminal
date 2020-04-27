@@ -82,7 +82,6 @@ using namespace Microsoft::Console::Render;
 [[nodiscard]] HRESULT VtEngine::_EraseCharacter(const short chars) noexcept
 {
     static const std::string format = "\x1b[%dX";
-
     return _WriteFormattedString(&format, chars);
 }
 
@@ -95,7 +94,6 @@ using namespace Microsoft::Console::Render;
 [[nodiscard]] HRESULT VtEngine::_CursorForward(const short chars) noexcept
 {
     static const std::string format = "\x1b[%dC";
-
     return _WriteFormattedString(&format, chars);
 }
 
@@ -197,7 +195,7 @@ using namespace Microsoft::Console::Render;
 // - S_OK if we succeeded, else an appropriate HRESULT for failing to allocate or write.
 [[nodiscard]] HRESULT VtEngine::_SetGraphicsBoldness(const bool isBold) noexcept
 {
-    const std::string fmt = isBold ? "\x1b[1m" : "\x1b[22m";
+    const std::string_view fmt = isBold ? "\x1b[1m" : "\x1b[22m";
     return _Write(fmt);
 }
 
@@ -277,7 +275,7 @@ using namespace Microsoft::Console::Render;
 // - S_OK if we succeeded, else an appropriate HRESULT for failing to allocate or write.
 [[nodiscard]] HRESULT VtEngine::_SetGraphicsRenditionDefaultColor(const bool fIsForeground) noexcept
 {
-    const std::string fmt = fIsForeground ? ("\x1b[39m") : ("\x1b[49m");
+    const std::string_view fmt = fIsForeground ? ("\x1b[39m") : ("\x1b[49m");
 
     return _Write(fmt);
 }

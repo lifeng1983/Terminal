@@ -17,7 +17,7 @@ public:
     IslandWindow() noexcept;
     virtual ~IslandWindow() override;
 
-    void MakeWindow() noexcept;
+    virtual void MakeWindow() noexcept;
     void Close();
     virtual void OnSize(const UINT width, const UINT height);
 
@@ -72,6 +72,7 @@ public:
 
     DECLARE_EVENT(DragRegionClicked, _DragRegionClickedHandlers, winrt::delegate<>);
     DECLARE_EVENT(WindowCloseButtonClicked, _windowCloseButtonClickedHandler, winrt::delegate<>);
+    WINRT_CALLBACK(MouseScrolled, winrt::delegate<void(til::point, int32_t)>);
 
 protected:
     void ForceResize()
